@@ -549,8 +549,8 @@ impl Tui {
                                 modified.push_str(&text[beg.offset..]);
                             }
                             Overflow::TruncateMiddle => {
-                                let mid_beg_x = restricted_width / 2;
-                                let mid_end_x = actual_width - mid_beg_x;
+                                let mid_beg_x = (restricted_width - 1) / 2;
+                                let mid_end_x = actual_width - restricted_width / 2;
                                 let beg = cfg.goto_visual(Point { x: mid_beg_x, y: 0 });
                                 let mut end = cfg.goto_visual(Point { x: mid_end_x, y: 0 });
                                 if end.visual_pos.x < mid_end_x {
