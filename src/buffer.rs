@@ -203,7 +203,7 @@ impl TextBuffer {
             indent_with_tabs: false,
             ruler: CoordType::MAX,
             encoding: "UTF-8",
-            newlines_are_crlf: false,
+            newlines_are_crlf: cfg!(windows), // Unfortunately Windows users insist on CRLF
             overtype: false,
 
             wants_cursor_visibility: false,
