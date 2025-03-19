@@ -953,6 +953,7 @@ fn draw_error_log(ctx: &mut Context, state: &mut State) {
             let idx = (off + i) % state.error_log.len();
             let msg = &state.error_log[idx][..];
             if !msg.is_empty() {
+                ctx.next_block_id_mixin(i as u64);
                 ctx.label("error", Overflow::TruncateTail, msg);
                 ctx.attr_padding(Rect::three(if i == 0 { 1 } else { 0 }, 2, 1));
             }
