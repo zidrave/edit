@@ -55,7 +55,8 @@ pub enum LocId {
     IndentationSpaces,
 
     SaveAsDialogTitle,
-    SaveAsDialogFilenameLabel,
+    SaveAsDialogPathLabel,
+    SaveAsDialogNameLabel,
 
     Count,
 }
@@ -465,8 +466,8 @@ const S_LANG_LUT: [[&str; LangId::Count as usize]; LocId::Count as usize] = [
         /* ko      */ "버전: ",
         /* pt_br   */ "Versão: ",
         /* ru      */ "Версия: ",
-        /* zh_hans */ "版本：",
-        /* zh_hant */ "版本：",
+        /* zh_hans */ "版本:",
+        /* zh_hant */ "版本:",
     ],
 
     // SearchLabel
@@ -480,8 +481,8 @@ const S_LANG_LUT: [[&str; LangId::Count as usize]; LocId::Count as usize] = [
         /* ko      */ "찾기:",
         /* pt_br   */ "Encontrar:",
         /* ru      */ "Найти:",
-        /* zh_hans */ "查找：",
-        /* zh_hant */ "尋找：",
+        /* zh_hans */ "查找:",
+        /* zh_hant */ "尋找:",
     ],
     // SearchClose
     [
@@ -613,19 +614,33 @@ const S_LANG_LUT: [[&str; LangId::Count as usize]; LocId::Count as usize] = [
         /* zh_hans */ "另存为…",
         /* zh_hant */ "另存新檔…",
     ],
-    // SaveAsDialogFilenameLabel
+    // SaveAsDialogPathLabel
     [
-        /* en      */ "Filename:",
+        /* en      */ "Folder:",
+        /* de      */ "Ordner:",
+        /* es      */ "Carpeta:",
+        /* fr      */ "Dossier:",
+        /* it      */ "Cartella:",
+        /* ja      */ "フォルダ:",
+        /* ko      */ "폴더:",
+        /* pt_br   */ "Pasta:",
+        /* ru      */ "Папка:",
+        /* zh_hans */ "文件夹:",
+        /* zh_hant */ "資料夾:",
+    ],
+    // SaveAsDialogNameLabel
+    [
+        /* en      */ "File name:",
         /* de      */ "Dateiname:",
         /* es      */ "Nombre de archivo:",
-        /* fr      */ "Nom de fichier :",
+        /* fr      */ "Nom de fichier:",
         /* it      */ "Nome del file:",
         /* ja      */ "ファイル名:",
         /* ko      */ "파일 이름:",
         /* pt_br   */ "Nome do arquivo:",
         /* ru      */ "Имя файла:",
-        /* zh_hans */ "文件名：",
-        /* zh_hant */ "檔案名稱：",
+        /* zh_hans */ "文件名:",
+        /* zh_hant */ "檔案名稱:",
     ],
 ];
 

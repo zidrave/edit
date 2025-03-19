@@ -351,7 +351,7 @@ fn draw(ctx: &mut Context, state: &mut State) {
 
 fn draw_menubar(ctx: &mut Context, state: &mut State) {
     ctx.menubar_begin();
-    ctx.attr_background_rgba(ctx.indexed(IndexedColor::BrightBlue));
+    ctx.attr_background_rgba(ctx.indexed(IndexedColor::White));
     {
         if ctx.menubar_menu_begin(loc(LocId::File), 'F') {
             draw_menu_file(ctx, state);
@@ -509,7 +509,7 @@ fn draw_editor(ctx: &mut Context, state: &mut State) {
 
 fn draw_statusbar(ctx: &mut Context, state: &mut State) {
     ctx.table_begin("statusbar");
-    ctx.attr_background_rgba(ctx.indexed(IndexedColor::BrightBlue));
+    ctx.attr_background_rgba(ctx.indexed(IndexedColor::White));
     ctx.table_set_cell_gap(Size {
         width: 2,
         height: 0,
@@ -591,44 +591,44 @@ fn draw_statusbar(ctx: &mut Context, state: &mut State) {
             {
                 ctx.table_next_row();
 
-                ctx.block_begin("indentation-type");
+                ctx.list_begin("type");
+                ctx.focus_on_first_present();
+                ctx.attr_padding(Rect::two(0, 2));
                 {
-                    if ctx.button("tabs", Overflow::Clip, loc(LocId::IndentationTabs)) {
+                    if ctx.list_item(
+                        state.buffer.indent_with_tabs(),
+                        Overflow::Clip,
+                        loc(LocId::IndentationTabs),
+                    ) {
                         state.buffer.set_indent_with_tabs(true);
                     }
-                    if state.buffer.indent_with_tabs() {
-                        ctx.attr_background_rgba(ctx.indexed(IndexedColor::Blue));
-                    }
-                    ctx.attr_padding(Rect::two(0, 2));
-                    ctx.focus_on_first_present();
-
-                    if ctx.button("spaces", Overflow::Clip, loc(LocId::IndentationSpaces)) {
+                    if ctx.list_item(
+                        !state.buffer.indent_with_tabs(),
+                        Overflow::Clip,
+                        loc(LocId::IndentationSpaces),
+                    ) {
                         state.buffer.set_indent_with_tabs(false);
                     }
-                    if !state.buffer.indent_with_tabs() {
-                        ctx.attr_background_rgba(ctx.indexed(IndexedColor::Blue));
-                    }
-                    ctx.attr_padding(Rect::two(0, 2));
                 }
-                ctx.block_end();
+                ctx.list_end();
 
-                ctx.block_begin("indentation-width");
+                ctx.list_begin("width");
+                ctx.attr_padding(Rect::two(0, 2));
                 {
                     for width in 1u8..=8 {
                         let ch = [b'0' + width];
                         let label = unsafe { std::str::from_utf8_unchecked(&ch) };
 
-                        ctx.next_block_id_mixin(width as u64);
-                        if ctx.button("width", Overflow::Clip, label) {
+                        if ctx.list_item(
+                            state.buffer.tab_size() == width as i32,
+                            Overflow::Clip,
+                            label,
+                        ) {
                             state.buffer.set_tab_size(width as i32);
                         }
-                        if state.buffer.tab_size() == width as i32 {
-                            ctx.attr_background_rgba(ctx.indexed(IndexedColor::Blue));
-                        }
-                        ctx.attr_padding(Rect::two(0, 2));
                     }
                 }
-                ctx.block_end();
+                ctx.list_end();
             }
             ctx.table_end();
         }
@@ -672,78 +672,95 @@ fn draw_dialog_saveas(ctx: &mut Context, state: &mut State) {
     ctx.modal_begin("saveas", loc(LocId::SaveAsDialogTitle));
     ctx.attr_intrinsic_size(Size { width, height });
     {
-        ctx.label("path", Overflow::TruncateMiddle, state.save_dir.as_str());
-
+        ctx.table_begin("path");
+        ctx.table_set_columns(&[0, COORD_TYPE_SAFE_MAX]);
+        ctx.table_set_cell_gap(Size {
+            width: 1,
+            height: 0,
+        });
+        ctx.attr_padding(Rect::two(1, 1));
         {
-            if state.save_entries.is_none() {
-                draw_refresh_save_entries(state);
-            }
+            ctx.table_next_row();
 
-            let files = state.save_entries.as_ref().unwrap();
-            let mut change_dir = None;
-
-            ctx.scrollarea_begin(
-                "directory",
-                Size {
-                    width: 0,
-                    // -1 for the label (top)
-                    // -1 for the label (bottom)
-                    // -1 for the editline (bottom)
-                    height: height - 3,
-                },
+            ctx.label(
+                "dir-label",
+                Overflow::Clip,
+                loc(LocId::SaveAsDialogPathLabel),
             );
-            ctx.next_block_id_mixin(state.save_dir.as_str().len() as u64);
-            ctx.list_begin("files");
-            for (i, entry) in files.iter().enumerate() {
-                if ctx.list_item(Overflow::TruncateMiddle, entry.as_str()) {
-                    let str = entry.as_str();
-                    if str.ends_with('/') || str == ".." {
-                        change_dir = Some(entry);
-                    } else if state.save_filename != str {
-                        state.save_filename = str.to_string();
-                    } else {
-                        // Treat clicking twice on an item as confirmation to save it.
-                        // TODO: This feels a bit weird if the user clicks on a `save_filename`-named item,
-                        // because it skips the double-click confirmation.
-                        state.wants_save = StateSave::Save;
-                    }
-                }
-                if i == 0 {
-                    ctx.focus_on_first_present();
-                }
-            }
-            ctx.list_end();
-            ctx.scrollarea_end();
+            ctx.label("dir", Overflow::TruncateMiddle, state.save_dir.as_str());
 
-            if let Some(entry) = change_dir {
-                let mut path = mem::take(&mut state.save_dir).take();
-
-                if entry.as_str() == ".." {
-                    path.pop();
-                } else {
-                    // `entry` is a directory name with trailing "/",
-                    // but we don't want the "/" in the path (it would look ugly).
-                    let entry_str = entry.as_str();
-                    path.push(&entry_str[..entry_str.len() - 1]);
-                }
-
-                state.save_dir = DisplayablePathBuf::new(path);
-                state.save_entries = None;
-                ctx.scrollarea_scroll_to(Point { x: 0, y: 0 });
+            ctx.table_next_row();
+            ctx.label(
+                "name-label",
+                Overflow::Clip,
+                &loc(LocId::SaveAsDialogNameLabel),
+            );
+            ctx.editline("name", &mut state.save_filename);
+            ctx.focus_on_first_present();
+            ctx.inherit_focus();
+            if ctx.is_focused() && ctx.consume_shortcut(vk::RETURN) {
+                state.wants_save = StateSave::Save;
             }
         }
+        ctx.table_end();
 
-        ctx.label(
-            "filename-label",
-            Overflow::Clip,
-            &loc(LocId::SaveAsDialogFilenameLabel),
+        if state.save_entries.is_none() {
+            draw_refresh_save_entries(state);
+        }
+
+        let files = state.save_entries.as_ref().unwrap();
+        let mut change_dir = None;
+
+        ctx.scrollarea_begin(
+            "directory",
+            Size {
+                width: 0,
+                // -1 for the label (top)
+                // -1 for the label (bottom)
+                // -1 for the editline (bottom)
+                height: height - 3,
+            },
         );
+        ctx.attr_background_rgba(ctx.indexed(IndexedColor::Cyan));
+        ctx.next_block_id_mixin(state.save_dir.as_str().len() as u64);
+        ctx.list_begin("files");
+        for entry in files.iter() {
+            if ctx.list_item(
+                state.save_filename == entry.as_str(),
+                Overflow::TruncateMiddle,
+                entry.as_str(),
+            ) {
+                let str = entry.as_str();
+                if str.ends_with('/') || str == ".." {
+                    change_dir = Some(entry);
+                } else if state.save_filename != str {
+                    state.save_filename = str.to_string();
+                } else {
+                    // Treat clicking twice on an item as confirmation to save it.
+                    // TODO: This feels a bit weird if the user clicks on a `save_filename`-named item,
+                    // because it skips the double-click confirmation.
+                    state.wants_save = StateSave::Save;
+                }
+            }
+        }
+        ctx.list_end();
+        ctx.scrollarea_end();
 
-        ctx.editline("filename", &mut state.save_filename);
-        ctx.focus_on_first_present();
-        ctx.inherit_focus();
-        if ctx.is_focused() && ctx.consume_shortcut(vk::RETURN) {
-            state.wants_save = StateSave::Save;
+        if let Some(entry) = change_dir {
+            let mut path = mem::take(&mut state.save_dir).take();
+
+            if entry.as_str() == ".." {
+                path.pop();
+            } else {
+                // `entry` is a directory name with trailing "/",
+                // but we don't want the "/" in the path (it would look ugly).
+                let entry_str = entry.as_str();
+                path.push(&entry_str[..entry_str.len() - 1]);
+            }
+
+            state.save_dir = DisplayablePathBuf::new(path);
+            state.save_entries = None;
+            ctx.scrollarea_scroll_to(Point { x: 0, y: 0 });
         }
 
         if state.wants_save == StateSave::Save && !state.save_filename.is_empty() {
@@ -822,12 +839,19 @@ fn draw_dialog_encoding_change(ctx: &mut Context, state: &mut State) {
     );
     {
         ctx.scrollarea_begin("scrollarea", Size { width, height });
+        ctx.inherit_focus();
+        ctx.attr_background_rgba(ctx.indexed(IndexedColor::Cyan));
         {
             let encodings = icu::get_available_encodings();
 
             ctx.list_begin("encodings");
+            ctx.inherit_focus();
             for encoding in encodings {
-                if ctx.list_item(Overflow::Clip, encoding.as_str()) {
+                if ctx.list_item(
+                    encoding.as_str() == state.buffer.encoding(),
+                    Overflow::Clip,
+                    encoding.as_str(),
+                ) {
                     state.wants_encoding_change = StateEncodingChange::None;
                     if reopen && state.path.is_some() {
                         if state.buffer.is_dirty() {

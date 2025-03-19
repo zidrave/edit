@@ -1994,7 +1994,7 @@ impl Context<'_, '_> {
                 return false;
             }
 
-            self.attr_background_rgba(self.indexed(IndexedColor::White));
+            self.attr_background_rgba(self.indexed(IndexedColor::Green));
 
             self.table_begin("flyout");
             self.attr_float(FloatSpec {
@@ -2016,7 +2016,7 @@ impl Context<'_, '_> {
         self.table_next_row();
         self.attr_focusable();
         if self.is_focused() {
-            self.attr_background_rgba(self.indexed(IndexedColor::BrightBlue));
+            self.attr_background_rgba(self.indexed(IndexedColor::Green));
         }
 
         let clicked =
@@ -2136,6 +2136,7 @@ impl Context<'_, '_> {
         }
 
         self.styled_label_end();
+        self.attr_padding(Rect::two(0, 1));
     }
 
     fn menubar_shortcut(&mut self, shortcut: InputKey) {
@@ -2154,12 +2155,7 @@ impl Context<'_, '_> {
             shortcut_text.push(shortcut_letter);
 
             self.label("shortcut", Overflow::Clip, &shortcut_text);
-            self.attr_padding(Rect {
-                left: 2,
-                top: 0,
-                right: 0,
-                bottom: 0,
-            });
+            self.attr_padding(Rect::two(0, 1));
         } else {
             self.block_begin("shortcut");
             self.block_end();
