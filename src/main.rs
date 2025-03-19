@@ -657,6 +657,21 @@ fn draw_statusbar(ctx: &mut Context, state: &mut State) {
         if state.buffer.is_overtype() && ctx.button("overtype", Overflow::Clip, "OVR") {
             state.buffer.set_overtype(false);
         }
+
+        if state.buffer.is_dirty() {
+            ctx.label("dirty", Overflow::Clip, "*");
+        }
+
+        ctx.block_begin("indirection");
+        ctx.attr_intrinsic_size(Size {
+            width: COORD_TYPE_SAFE_MAX,
+            height: 1,
+        });
+        {
+            ctx.label("exit", Overflow::TruncateMiddle, &state.save_filename);
+            ctx.attr_alignment(Alignment::Right);
+        }
+        ctx.block_end();
     }
     ctx.table_end();
 }
