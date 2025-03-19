@@ -67,6 +67,7 @@ pub struct Tui {
     cached_text_buffers: Vec<CachedTextBuffer>,
     hovered_node_path: Vec<u64>,
     focused_node_path: Vec<u64>,
+    focused_node_path_for_scrolling: Vec<u64>,
 
     prev_tree: Tree,
     prev_node_map: Vec<*const Node>,
@@ -94,6 +95,7 @@ impl Tui {
             cached_text_buffers: Vec::with_capacity(16),
             hovered_node_path: Vec::with_capacity(16),
             focused_node_path: Vec::with_capacity(16),
+            focused_node_path_for_scrolling: Vec::with_capacity(16),
 
             prev_tree: Tree::new(),
             prev_node_map: vec![null(); 1],
@@ -127,6 +129,10 @@ impl Tui {
         if self.mouse_state > InputMouseState::Right {
             self.mouse_state = InputMouseState::None;
             self.mouse_down_position = Point::MIN;
+        }
+
+        if self.scroll_to_focused() {
+            self.needs_settling();
         }
 
         let mut input_consumed = false;
@@ -164,6 +170,7 @@ impl Tui {
                 let next_position = mouse.position;
                 let next_scroll = mouse.scroll;
 
+                let mut hovered_node = null();
                 let mut focused_node = null();
 
                 for root in self.prev_tree.iterate_roots() {
@@ -172,6 +179,7 @@ impl Tui {
                             // Skip the entire sub-tree, because it doesn't contain the cursor.
                             return VisitControl::SkipChildren;
                         }
+                        hovered_node = node;
                         if node.attributes.focusable {
                             focused_node = node;
                         }
@@ -179,8 +187,10 @@ impl Tui {
                     });
                 }
 
-                let focused_node = unsafe { focused_node.as_ref() };
-                Self::build_node_path(focused_node, &mut self.hovered_node_path);
+                Self::build_node_path(
+                    unsafe { hovered_node.as_ref() },
+                    &mut self.hovered_node_path,
+                );
 
                 if self.mouse_state != InputMouseState::None && next_state == InputMouseState::None
                 {
@@ -191,7 +201,10 @@ impl Tui {
                     && next_state == InputMouseState::Left
                 {
                     // On left-mouse-down we change focus.
-                    self.focused_node_path = self.hovered_node_path.clone();
+                    Self::build_node_path(
+                        unsafe { focused_node.as_ref() },
+                        &mut self.focused_node_path,
+                    );
                     self.mouse_down_position = next_position;
                     self.needs_more_settling(); // See `needs_more_settling()`.
                 }
@@ -377,7 +390,7 @@ impl Tui {
         // But we put a maximum on how many times we'll re-render in a row, in order
         // to prevent accidental infinite loops. Honestly, anything >2 would be weird.
         debug_assert!(self.settling_want < 5);
-        self.settling_want = (self.settling_want + 1).min(10);
+        self.settling_want = (self.settling_have + 1).min(10);
     }
 
     /// Renders all nodes into a string-frame representation.
@@ -848,30 +861,6 @@ impl Tui {
             }
         }
 
-        if input == vk::UP || input == vk::DOWN {
-            if let Some(list) = Tree::node_ref(focused.parent) {
-                if matches!(list.content, NodeContent::List) {
-                    let mut next = if input == vk::UP {
-                        focused.siblings.prev
-                    } else {
-                        focused.siblings.next
-                    };
-                    if next.is_null() {
-                        next = if input == vk::UP {
-                            list.children.last
-                        } else {
-                            list.children.first
-                        };
-                    }
-                    let next = Tree::node_ref(next).unwrap();
-                    if !ptr::eq(next, focused) {
-                        Tui::build_node_path(Some(next), &mut self.focused_node_path);
-                        return true;
-                    }
-                }
-            }
-        }
-
         let forward = match input {
             SHIFT_TAB => false,
             vk::TAB => true,
@@ -922,6 +911,37 @@ impl Tui {
             );
             true
         }
+    }
+
+    // Scroll the focused node(s) into view inside scrollviews
+    fn scroll_to_focused(&mut self) -> bool {
+        if self.focused_node_path_for_scrolling == self.focused_node_path {
+            return false;
+        }
+
+        let Some(focused) = self.get_prev_node(self.focused_node_path[0]) else {
+            // Node not found because we're using the old layout tree.
+            // Retry in the next rendering loop.
+            return true;
+        };
+
+        let mut scrollarea = Tree::node_mut(focused).unwrap();
+        let mut scroll_to = focused.outer;
+
+        while !scrollarea.parent.is_null() && scrollarea.attributes.float.is_none() {
+            if let NodeContent::Scrollarea(scroll_offset) = &mut scrollarea.content {
+                let mut scroll_y = scroll_offset.y;
+                scroll_y = scroll_y.min(scroll_to.top - scrollarea.inner.top + scroll_offset.y);
+                scroll_y =
+                    scroll_y.max(scroll_to.bottom - scrollarea.inner.bottom + scroll_offset.y);
+                scroll_offset.y = scroll_y;
+                scroll_to = scrollarea.outer;
+            }
+            scrollarea = Tree::node_mut(scrollarea.parent).unwrap();
+        }
+
+        self.focused_node_path_for_scrolling = self.focused_node_path.clone();
+        true
     }
 }
 
@@ -1014,9 +1034,12 @@ impl Context<'_, '_> {
     }
 
     pub fn steal_focus(&mut self) {
-        let last_node = self.tree.last_node_ref();
+        self.steal_focus_for(self.tree.last_node_ref());
+    }
+
+    fn steal_focus_for(&mut self, node: &Node) {
         self.needs_settling = true;
-        Tui::build_node_path(Some(last_node), &mut self.tui.focused_node_path);
+        Tui::build_node_path(Some(node), &mut self.tui.focused_node_path);
     }
 
     pub fn toss_focus_up(&mut self) {
@@ -1140,6 +1163,11 @@ impl Context<'_, '_> {
         self.tui.is_node_hovered(last_node.id)
     }
 
+    pub fn contains_hover(&mut self) -> bool {
+        let last_node = self.tree.last_node_ref();
+        self.tui.is_subtree_hovered(last_node.id)
+    }
+
     pub fn is_focused(&mut self) -> bool {
         let last_node = self.tree.last_node_ref();
         self.tui.is_node_focused(last_node.id)
@@ -1164,7 +1192,7 @@ impl Context<'_, '_> {
         });
 
         let last_node = self.tree.last_node_mut();
-        last_node.content = NodeContent::Modal(title.to_string());
+        last_node.content = NodeContent::Modal(format!(" {} ", title));
     }
 
     pub fn modal_end(&mut self) -> bool {
@@ -1330,7 +1358,7 @@ impl Context<'_, '_> {
 
     fn button_activated(&mut self) -> bool {
         if !self.input_consumed
-            && ((self.input_mouse_gesture == InputMouseGesture::Click && self.is_hovering())
+            && ((self.input_mouse_gesture == InputMouseGesture::Click && self.contains_hover())
                 || self.input_keyboard == Some(vk::RETURN)
                 || self.input_keyboard == Some(vk::SPACE))
             && self.is_focused()
@@ -1945,27 +1973,121 @@ impl Context<'_, '_> {
 
     pub fn list_begin(&mut self, classname: &'static str) {
         self.block_begin(classname);
+        self.attr_focusable();
 
         let last_node = self.tree.last_node_mut();
-        last_node.content = NodeContent::List;
+        let selected = self
+            .tui
+            .get_prev_node(last_node.id)
+            .map_or(0, |n| match &n.content {
+                NodeContent::List(content) => content.selected,
+                _ => 0,
+            });
+        last_node.content = NodeContent::List(ListContent {
+            selected,
+            selected_node: ptr::null(),
+            selection_changed: false,
+        });
     }
 
-    pub fn list_item(&mut self, overflow: Overflow, text: &str) -> bool {
-        let parent = self.tree.current_node_ref();
-        self.next_block_id_mixin(parent.child_count as u64);
+    pub fn list_item(&mut self, select: bool, overflow: Overflow, text: &str) -> bool {
+        let list = self.tree.current_node_mut();
+        let content = match &mut list.content {
+            NodeContent::List(content) => content,
+            _ => panic!(),
+        };
+        let idx = list.child_count;
+
+        self.next_block_id_mixin(hash_str(idx as u64, text));
         self.styled_label_begin("item", overflow);
         self.attr_focusable();
 
-        let has_focus = self.is_focused();
-        self.styled_label_add_text(if has_focus { "> " } else { "  " });
-        self.styled_label_add_text(text);
+        let item = self.tree.last_node_ref();
+        let item_id = item.id;
+        let selected_before = content.selected == item_id;
+        let mut selected_now = selected_before;
 
+        // Clicking an item activates it
+        let clicked = !self.input_consumed
+            && (self.input_mouse_gesture == InputMouseGesture::Click && self.is_hovering());
+        // Pressing Enter on a selected item activates it as well
+        let entered = selected_before
+            && !self.input_consumed
+            && matches!(self.input_keyboard, Some(vk::RETURN));
+        let activated = clicked || entered;
+        if activated {
+            self.set_input_consumed();
+        }
+
+        // Inherit the default selection & Click changes selection
+        if (select && content.selected == 0) || (!selected_now && clicked) {
+            selected_now = true;
+            content.selected = item_id;
+            content.selection_changed = true;
+        }
+
+        // Note down the selected node for keyboard navigation.
+        if selected_now {
+            content.selected_node = item;
+        }
+
+        if selected_now {
+            self.attr_background_rgba(self.indexed(IndexedColor::Green));
+        }
+        self.styled_label_add_text(if selected_now { "> " } else { "  " });
+        self.styled_label_add_text(text);
         self.styled_label_end();
-        self.button_activated()
+
+        selected_before && activated
     }
 
     pub fn list_end(&mut self) {
         self.block_end();
+
+        let list = self.tree.last_node_mut();
+        let content = match &mut list.content {
+            NodeContent::List(content) => content,
+            _ => panic!(),
+        };
+
+        if content.selected_node.is_null() && !list.children.first.is_null() {
+            let node = Tree::node_ref(list.children.first).unwrap();
+            content.selected = node.id;
+            content.selected_node = node;
+            content.selection_changed = true;
+        }
+
+        if !content.selected_node.is_null()
+            && !self.input_consumed
+            && (self.input_keyboard == Some(vk::UP) || self.input_keyboard == Some(vk::DOWN))
+            && self.contains_focus()
+        {
+            let selected = Tree::node_ref(content.selected_node).unwrap();
+            let forward = self.input_keyboard == Some(vk::DOWN);
+            let mut next = if forward {
+                selected.siblings.next
+            } else {
+                selected.siblings.prev
+            };
+            if next.is_null() {
+                next = if forward {
+                    list.children.first
+                } else {
+                    list.children.last
+                };
+            }
+            if let Some(next) = Tree::node_ref(next) {
+                content.selected = next.id;
+                content.selected_node = next;
+                content.selection_changed = true;
+            }
+        }
+
+        if content.selection_changed {
+            if let Some(item) = Tree::node_ref(content.selected_node) {
+                self.steal_focus_for(item);
+            }
+        }
     }
 
     pub fn menubar_begin(&mut self) {
@@ -2406,6 +2528,12 @@ struct Attributes {
     focus_brackets: bool,
 }
 
+struct ListContent {
+    selected: u64,
+    selected_node: *const Node, // Points to the Node that holds this ListContent instance, if any.
+    selection_changed: bool,
+}
+
 struct TableContent {
     columns: Vec<CoordType>,
     cell_gap: Size,
@@ -2457,7 +2585,7 @@ struct TextareaContent {
 enum NodeContent {
     #[default]
     None,
-    List,
+    List(ListContent),
     Modal(String), // title
     Table(TableContent),
     Text(TextContent),
