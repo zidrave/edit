@@ -357,8 +357,8 @@ impl Tui {
 
                 x += float.offset.x;
                 y += float.offset.y;
-                x -= (float.gravity_x * size.width as f32 + 0.5f32) as CoordType;
-                y -= (float.gravity_y * size.height as f32 + 0.5f32) as CoordType;
+                x -= (float.gravity_x * size.width as f32) as CoordType;
+                y -= (float.gravity_y * size.height as f32) as CoordType;
 
                 root.outer.left = x;
                 root.outer.top = y;
