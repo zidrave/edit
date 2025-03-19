@@ -1,0 +1,2299 @@
+//! Implements a Unicode-aware, layout-aware text buffer for terminals.
+//! It's based on a gap buffer. It has no line cache and instead relies
+//! on the performance of the ucd module for fast text navigation.
+//!
+//! If the project ever outgrows a basic gap buffer (e.g. to add time travel)
+//! an ideal, alternative architecture would be a piece table with immutable trees.
+//! The tree nodes can be allocated on the same arena allocator as the added chunks,
+//! making lifetime management fairly easy. The algorithm is described here:
+//! * https://cdacamar.github.io/data%20structures/algorithms/benchmarking/text%20editors/c++/editor-data-structures/
+//! * https://github.com/cdacamar/fredbuf
+//!
+//! The downside is that text navigation & search takes a performance hit due to small chunks.
+//! The solution to the former is to keep line caches, which further complicates the architecture.
+//! There's no solution for the latter. However, there's a chance that the performance will still be sufficient.
+
+use crate::framebuffer::{Framebuffer, IndexedColor};
+use crate::helpers::{self, COORD_TYPE_SAFE_MAX, CoordType, Point, Rect};
+use crate::memchr::memchr2;
+use crate::ucd::Document;
+use crate::{apperr, icu, sys, trust_me_bro, ucd};
+use std::borrow::Cow;
+use std::cell::UnsafeCell;
+use std::collections::LinkedList;
+use std::fmt::Write as _;
+use std::fs::File;
+use std::io::Read as _;
+use std::io::Write as _;
+use std::mem::MaybeUninit;
+use std::ops::{Deref, DerefMut};
+use std::path::Path;
+use std::rc::Rc;
+use std::{mem, ptr, slice, str};
+
+/// The margin template is used for line numbers.
+/// The max. line number we should ever expect is probably 64-bit,
+/// and so this template fits 19 digits, followed by " │ ".
+const MARGIN_TEMPLATE: &str = "                    │ ";
+/// Just a bunch of whitespace you can use for turning tabs into spaces.
+/// Happens to reuse MARGIN_TEMPLATE, because it has sufficient whitespace.
+const TAB_WHITESPACE: &str = MARGIN_TEMPLATE;
+
+#[derive(Copy, Clone)]
+pub struct TextBufferStatistics {
+    logical_lines: CoordType,
+    visual_lines: CoordType,
+}
+
+#[derive(Copy, Clone)]
+enum TextBufferSelection {
+    None,
+    Active { beg: Point, end: Point },
+    Done { beg: Point, end: Point },
+}
+impl TextBufferSelection {
+    fn is_some(&self) -> bool {
+        !matches!(self, Self::None)
+    }
+}
+
+#[derive(Copy, Clone, Eq, PartialEq)]
+enum HistoryType {
+    None,
+    CursorMovement,
+    Write,
+    Delete,
+}
+
+struct HistoryEntry {
+    /// Logical cursor position before the change was made.
+    cursor_before: Point,
+    selection_before: TextBufferSelection,
+    stats_before: TextBufferStatistics,
+    generation_before: u32,
+    /// Logical cursor position where the change took place.
+    /// The position is at the start of the changed range.
+    cursor: Point,
+    /// Text that was deleted from the buffer.
+    deleted: Vec<u8>,
+    /// Text that was added to the buffer.
+    added: Vec<u8>,
+}
+
+struct ActiveSearch {
+    pattern: String,
+    options: SearchOptions,
+    text: icu::Text,
+    regex: icu::Regex,
+    at_start: bool,
+    no_matches: bool,
+}
+
+#[derive(Default, Clone, Copy, Eq, PartialEq)]
+pub struct SearchOptions {
+    pub match_case: bool,
+    pub whole_word: bool,
+    pub use_regex: bool,
+}
+
+/// Caches the start and length of the active edit line for a single edit.
+/// This helps us avoid having to remeasure the buffer after an edit.
+struct ActiveEditLineInfo {
+    /// Points to the start of the currently being edited line.
+    safe_start: ucd::UcdCursor,
+    line_height_in_rows: CoordType,
+    distance_next_line_start: usize,
+}
+
+pub enum CursorMovement {
+    Grapheme,
+    Word,
+}
+
+#[derive(Clone)]
+pub struct RcTextBuffer(Rc<UnsafeCell<TextBuffer>>);
+
+impl RcTextBuffer {
+    pub fn new(small: bool) -> apperr::Result<Self> {
+        let tb = TextBuffer::new(small)?;
+        Ok(Self(Rc::new(UnsafeCell::new(tb))))
+    }
+}
+
+impl Deref for RcTextBuffer {
+    type Target = TextBuffer;
+
+    fn deref(&self) -> &Self::Target {
+        unsafe { &*self.0.get() }
+    }
+}
+
+impl DerefMut for RcTextBuffer {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        unsafe { &mut *self.0.get() }
+    }
+}
+
+pub struct TextBuffer {
+    buffer: GapBuffer,
+
+    undo_stack: LinkedList<HistoryEntry>,
+    redo_stack: LinkedList<HistoryEntry>,
+    last_history_type: HistoryType,
+    last_save_generation: u32,
+
+    active_edit_line_info: Option<ActiveEditLineInfo>,
+    active_edit_depth: i32,
+    active_edit_off: usize,
+
+    stats: TextBufferStatistics,
+    cursor: ucd::UcdCursor,
+    // When scrolling significant amounts of text away from the cursor,
+    // rendering will naturally slow down proportionally to the distance.
+    // To avoid this, we cache the cursor position for rendering.
+    // Must be cleared on every edit or reflow.
+    cursor_for_rendering: Option<ucd::UcdCursor>,
+    selection: TextBufferSelection,
+    search: Option<ActiveSearch>,
+
+    width: CoordType,
+    margin_width: CoordType,
+    margin_enabled: bool,
+    word_wrap_column: CoordType,
+    word_wrap_enabled: bool,
+    tab_size: CoordType,
+    indent_with_tabs: bool,
+    ruler: CoordType,
+    encoding: &'static str,
+    newlines_are_crlf: bool,
+    overtype: bool,
+
+    wants_cursor_visibility: bool,
+}
+
+impl TextBuffer {
+    pub fn new(small: bool) -> apperr::Result<Self> {
+        Ok(Self {
+            buffer: GapBuffer::new(small)?,
+
+            undo_stack: LinkedList::new(),
+            redo_stack: LinkedList::new(),
+            last_history_type: HistoryType::None,
+            last_save_generation: 0,
+
+            active_edit_line_info: None,
+            active_edit_depth: 0,
+            active_edit_off: 0,
+
+            stats: TextBufferStatistics {
+                logical_lines: 1,
+                visual_lines: 1,
+            },
+            cursor: ucd::UcdCursor::default(),
+            cursor_for_rendering: None,
+            selection: TextBufferSelection::None,
+            search: None,
+
+            width: 0,
+            margin_width: 0,
+            margin_enabled: false,
+            word_wrap_column: CoordType::MAX,
+            word_wrap_enabled: false,
+            tab_size: 4,
+            indent_with_tabs: false,
+            ruler: CoordType::MAX,
+            encoding: "UTF-8",
+            newlines_are_crlf: false,
+            overtype: false,
+
+            wants_cursor_visibility: false,
+        })
+    }
+
+    pub fn text_length(&self) -> usize {
+        self.buffer.len()
+    }
+
+    pub fn is_dirty(&self) -> bool {
+        self.last_save_generation != self.buffer.generation
+    }
+
+    pub fn mark_as_dirty(&mut self) {
+        self.last_save_generation = self.buffer.generation.wrapping_sub(1);
+    }
+
+    fn mark_as_clean(&mut self) {
+        self.last_save_generation = self.buffer.generation;
+    }
+
+    pub fn encoding(&self) -> &'static str {
+        self.encoding
+    }
+
+    pub fn is_crlf(&self) -> bool {
+        self.newlines_are_crlf
+    }
+
+    pub fn normalize_newlines(&mut self, crlf: bool) {
+        let newline: &[u8] = if crlf { b"\r\n" } else { b"\n" };
+        let mut off = 0;
+
+        let mut cursor_offset = self.cursor.offset;
+        let mut cursor_for_rendering_offset = self
+            .cursor_for_rendering
+            .map_or(cursor_offset, |c| c.offset);
+
+        #[cfg(debug_assertions)]
+        let mut adjusted_newlines = 0;
+
+        'outer: loop {
+            // Seek to the offset of the next line start.
+            loop {
+                let chunk = self.read_forward(off);
+                if chunk.is_empty() {
+                    break 'outer;
+                }
+
+                let (delta, line) = ucd::newlines_forward(chunk, 0, 0, 1);
+                off += delta;
+                if line == 1 {
+                    break;
+                }
+            }
+
+            // Get the preceding newline.
+            let chunk = self.read_backward(off);
+            let chunk_newline_len = if chunk.ends_with(b"\r\n") { 2 } else { 1 };
+            let chunk_newline = &chunk[chunk.len() - chunk_newline_len..];
+
+            if chunk_newline != newline {
+                // If this newline is still before our cursor position, then it still has an effect on its offset.
+                // Any newline adjustments past that cursor position are irrelevant.
+                let delta = newline.len() as isize - chunk_newline_len as isize;
+                if off <= cursor_offset {
+                    cursor_offset = cursor_offset.saturating_add_signed(delta);
+                    #[cfg(debug_assertions)]
+                    {
+                        adjusted_newlines += 1;
+                    }
+                }
+                if off <= cursor_for_rendering_offset {
+                    cursor_for_rendering_offset =
+                        cursor_for_rendering_offset.saturating_add_signed(delta);
+                }
+
+                // Replace the newline.
+                off -= chunk_newline_len;
+                let gap = self
+                    .buffer
+                    .allocate_gap(off, newline.len(), chunk_newline_len);
+                gap.copy_from_slice(newline);
+                self.buffer.commit_gap(newline.len());
+                off += newline.len();
+            }
+        }
+
+        // If this fails, the cursor offset calculation above is wrong.
+        #[cfg(debug_assertions)]
+        debug_assert_eq!(adjusted_newlines, self.cursor.logical_pos.y);
+
+        self.cursor.offset = cursor_offset;
+        if let Some(cursor) = &mut self.cursor_for_rendering {
+            cursor.offset = cursor_for_rendering_offset;
+        }
+
+        self.newlines_are_crlf = crlf;
+    }
+
+    pub fn is_overtype(&self) -> bool {
+        self.overtype
+    }
+
+    pub fn set_overtype(&mut self, overtype: bool) {
+        self.overtype = overtype;
+    }
+
+    pub fn get_logical_line_count(&self) -> CoordType {
+        self.stats.logical_lines
+    }
+
+    pub fn get_visual_line_count(&self) -> CoordType {
+        self.stats.visual_lines
+    }
+
+    pub fn get_cursor_logical_pos(&self) -> Point {
+        self.cursor.logical_pos
+    }
+
+    pub fn get_cursor_visual_pos(&self) -> Point {
+        self.cursor.visual_pos
+    }
+
+    pub fn get_margin_width(&self) -> CoordType {
+        self.margin_width
+    }
+
+    pub fn get_text_width(&self) -> CoordType {
+        self.width - self.margin_width
+    }
+
+    pub fn is_word_wrap_enabled(&self) -> bool {
+        self.word_wrap_enabled
+    }
+
+    pub fn make_cursor_visible(&mut self) {
+        self.wants_cursor_visibility = true;
+    }
+
+    pub fn take_cursor_visibility_request(&mut self) -> bool {
+        mem::take(&mut self.wants_cursor_visibility)
+    }
+
+    // NOTE: It's expected that the tui code calls `set_width()` sometime after this.
+    // This will then trigger the actual recalculation of the cursor position.
+    pub fn toggle_word_wrap(&mut self) {
+        self.word_wrap_enabled = !self.word_wrap_enabled;
+        self.width = 0; // Force a reflow.
+        self.make_cursor_visible();
+    }
+
+    pub fn set_width(&mut self, width: CoordType) -> bool {
+        if width <= 0 || width == self.width {
+            return false;
+        }
+
+        self.width = width;
+        self.reflow(true);
+        true
+    }
+
+    pub fn set_margin_enabled(&mut self, enabled: bool) -> bool {
+        if self.margin_enabled == enabled {
+            return false;
+        }
+
+        self.margin_enabled = enabled;
+        self.reflow(true);
+        true
+    }
+
+    pub fn tab_size(&self) -> CoordType {
+        self.tab_size
+    }
+
+    pub fn set_tab_size(&mut self, width: CoordType) -> bool {
+        if width <= 0 || width == self.tab_size {
+            return false;
+        }
+
+        self.tab_size = width;
+        self.reflow(true);
+        true
+    }
+
+    pub fn set_ruler(&mut self, column: Option<CoordType>) {
+        self.ruler = column.unwrap_or(CoordType::MAX);
+    }
+
+    fn reflow(&mut self, force: bool) {
+        // +1 onto logical_lines, because line numbers are 1-based.
+        // +1 onto log10, because we want the digit width and not the actual log10.
+        // +3 onto log10, because we append " | " to the line numbers to form the margin.
+        self.margin_width = if self.margin_enabled {
+            self.stats.logical_lines.ilog10() as CoordType + 4
+        } else {
+            0
+        };
+
+        let word_wrap_column = if self.word_wrap_enabled {
+            self.get_text_width()
+        } else {
+            CoordType::MAX
+        };
+
+        if force || self.word_wrap_column != word_wrap_column {
+            self.word_wrap_column = word_wrap_column;
+
+            if self.cursor.offset != 0 {
+                self.cursor = self.cursor_move_to_logical_internal(
+                    ucd::UcdCursor::default(),
+                    self.cursor.logical_pos,
+                );
+            }
+
+            // Recalculate the line statistics.
+            if self.word_wrap_enabled {
+                let end = self.cursor_move_to_logical_internal(self.cursor, Point::MAX);
+                self.stats.visual_lines = end.visual_pos.y + 1;
+            } else {
+                self.stats.visual_lines = self.stats.logical_lines;
+            }
+        }
+
+        self.cursor_for_rendering = None;
+    }
+
+    pub fn indent_with_tabs(&self) -> bool {
+        self.indent_with_tabs
+    }
+
+    pub fn set_indent_with_tabs(&mut self, indent_with_tabs: bool) {
+        self.indent_with_tabs = indent_with_tabs;
+    }
+
+    pub fn set_encoding(&mut self, encoding: &'static str) {
+        self.encoding = encoding;
+        self.buffer.generation = self.buffer.generation.wrapping_add(1);
+    }
+
+    /// Replaces the entire buffer contents with the given `text`.
+    /// Assumes that the line count doesn't change.
+    pub fn copy_from_str(&mut self, text: &str) {
+        if self.buffer.copy_from_str(text) {
+            self.recalc_after_content_swap();
+            self.cursor_move_to_logical(Point::MAX);
+        }
+    }
+
+    pub fn debug_replace_everything(&mut self, text: &str) {
+        if self.buffer.copy_from_str(text) {
+            let before = self.cursor.logical_pos;
+            let end = self.cursor_move_to_logical_internal(
+                ucd::UcdCursor::default(),
+                Point {
+                    x: 0,
+                    y: CoordType::MAX,
+                },
+            );
+            self.stats.logical_lines = end.logical_pos.y + 1;
+            self.stats.visual_lines = self.stats.logical_lines;
+            self.recalc_after_content_swap();
+            self.cursor_move_to_logical(before);
+        }
+    }
+
+    fn recalc_after_content_swap(&mut self) {
+        // If the buffer was changed, nothing we previously saved can be relied upon.
+        self.undo_stack.clear();
+        self.redo_stack.clear();
+        self.last_history_type = HistoryType::None;
+        self.cursor = ucd::UcdCursor::default();
+        self.cursor_for_rendering = None;
+        self.selection = TextBufferSelection::None;
+        self.search = None;
+        self.mark_as_clean();
+        self.reflow(true);
+    }
+
+    /// Copies the contents of the buffer into a string.
+    pub fn save_as_string(&mut self, dst: &mut String) {
+        self.buffer.copy_into_string(dst);
+        self.mark_as_clean();
+    }
+
+    /// Reads a file from disk into the text buffer, detecting encoding and BOM.
+    pub fn read_file(
+        &mut self,
+        file: &mut File,
+        encoding: Option<&'static str>,
+    ) -> apperr::Result<()> {
+        let mut read = 0;
+
+        #[allow(invalid_value)]
+        let mut buf: [u8; 4096] = unsafe { MaybeUninit::uninit().assume_init() };
+        let mut first_chunk_len = 0;
+
+        // Read enough bytes to detect the BOM.
+        while first_chunk_len < BOM_MAX_LEN {
+            read = file.read(&mut buf[first_chunk_len..])?;
+            if read == 0 {
+                break;
+            }
+            first_chunk_len += read;
+        }
+
+        if let Some(encoding) = encoding {
+            self.encoding = encoding;
+        } else {
+            let bom = detect_bom(&buf[..first_chunk_len]);
+            self.encoding = bom.unwrap_or("UTF-8");
+        }
+
+        // TODO: Since reading the file can fail, we should ensure that we also reset the cursor here.
+        // I don't do it, so that `recalc_after_content_swap()` works.
+        self.buffer.clear();
+
+        let done = read == 0;
+        if self.encoding == "UTF-8" {
+            self.read_file_as_utf8(file, &mut buf, first_chunk_len, done)?;
+        } else {
+            self.read_file_with_icu(file, &mut buf, first_chunk_len, done)?;
+        }
+
+        // Figure out
+        // * the logical line count
+        // * the newline type (LF or CRLF)
+        // * the indentation type (tabs or spaces)
+        {
+            let chunk = self.read_forward(0);
+            let mut offset = 0;
+            let mut lines = 0;
+            // Number of lines ending in CRLF.
+            let mut crlf_count = 0;
+            // Number of lines starting with a tab.
+            let mut tab_indentations = 0;
+            // Number of lines starting with a space.
+            let mut space_indentations = 0;
+            // Histogram of the indentation depth of lines starting with between 2 and 8 spaces.
+            // In other words, `space_indentation_sizes[0]` is the number of lines starting with 2 spaces.
+            let mut space_indentation_sizes = [0; 7];
+
+            loop {
+                (offset, lines) = ucd::newlines_forward(chunk, offset, lines, lines + 1);
+                assert!(offset <= chunk.len());
+
+                // Check if the preceding line ended in CRLF.
+                if offset >= 2 && &chunk[offset - 2..offset] == b"\r\n" {
+                    crlf_count += 1;
+                }
+
+                // Check if the line starts with a tab.
+                if offset < chunk.len() && chunk[offset] == b'\t' {
+                    tab_indentations += 1;
+                } else {
+                    // Otherwise, check how many spaces the line starts with. Searching for >8 spaces
+                    // allows us to reject lines that have more than 1 level of indentation.
+                    let space_indentation = chunk[offset..]
+                        .iter()
+                        .take(9)
+                        .take_while(|&&c| c == b' ')
+                        .count();
+                    // We'll also reject lines starting with 1 space, because that's too fickle as a heuristic.
+                    if (2..=8).contains(&space_indentation) {
+                        space_indentations += 1;
+                        space_indentation_sizes[space_indentation - 2] += 1;
+                    }
+                }
+
+                // We'll limit our heuristics to the first 100 lines.
+                // That should hopefully be enough in practice.
+                if offset >= chunk.len() || lines >= 100 {
+                    break;
+                }
+            }
+
+            // We'll assume CRLF if more than half of the lines end in CRLF.
+            let newlines_are_crlf = crlf_count >= lines / 2;
+
+            // We'll assume tabs if there are more lines starting with tabs than with spaces.
+            let indent_with_tabs = tab_indentations > space_indentations;
+            let tab_size = if indent_with_tabs {
+                // Tabs will get a visual size of 4 spaces by default.
+                4
+            } else {
+                // Otherwise, we'll assume the most common indentation depth.
+                // We can't use `max_by_key`, because that will return the largest index and we
+                // want the smallest (= prefer 2 over 4 over 8 if they're all equally common).
+                let mut max = 0;
+                let mut tab_size = 4;
+                for (i, &count) in space_indentation_sizes.iter().enumerate() {
+                    if count > max {
+                        max = count;
+                        tab_size = i as CoordType + 2;
+                    }
+                }
+                tab_size
+            };
+
+            // If the file has more than 100 lines, figure out how many are remaining.
+            if offset < chunk.len() {
+                (_, lines) = ucd::newlines_forward(chunk, offset, lines, CoordType::MAX);
+            }
+
+            // Add 1, because the last line doesn't end in a newline (it ends in the literal end).
+            self.stats.logical_lines = lines + 1;
+            self.stats.visual_lines = self.stats.logical_lines;
+            self.newlines_are_crlf = newlines_are_crlf;
+            self.indent_with_tabs = indent_with_tabs;
+            self.tab_size = tab_size;
+        }
+
+        self.recalc_after_content_swap();
+        Ok(())
+    }
+
+    fn read_file_as_utf8(
+        &mut self,
+        file: &mut File,
+        buf: &mut [u8],
+        first_chunk_len: usize,
+        done: bool,
+    ) -> apperr::Result<()> {
+        {
+            let mut first_chunk = &buf[..first_chunk_len];
+            if first_chunk.starts_with(b"\xEF\xBB\xBF") {
+                first_chunk = &first_chunk[3..];
+                self.encoding = "UTF-8 BOM";
+            }
+
+            let gap = self.buffer.allocate_gap(0, first_chunk.len(), 0);
+            gap.copy_from_slice(first_chunk);
+            self.buffer.commit_gap(first_chunk.len());
+        }
+
+        if done {
+            return Ok(());
+        }
+
+        // If we don't have file metadata, the input may be a pipe or a socket.
+        // Every read will have the same size until we hit the end.
+        let mut chunk_size = 64 * 1024;
+        let mut extra_chunk_size = 8 * 1024;
+
+        if let Ok(m) = file.metadata() {
+            // Usually the next read of size `chunk_size` will read the entire file,
+            // but if the size has changed for some reason, then `extra_chunk_size`
+            // should be large enough to read the rest of the file.
+            // 4KiB is not too large and not too slow.
+            let len = m.len() as usize;
+            chunk_size = len.saturating_sub(first_chunk_len);
+            extra_chunk_size = 4096;
+        }
+
+        loop {
+            let gap = self.buffer.allocate_gap(self.text_length(), chunk_size, 0);
+
+            let read = file.read(gap)?;
+            if read == 0 {
+                break;
+            }
+
+            self.buffer.commit_gap(read);
+            chunk_size = extra_chunk_size;
+        }
+
+        Ok(())
+    }
+
+    fn read_file_with_icu(
+        &mut self,
+        file: &mut File,
+        buf: &mut [u8],
+        first_chunk_len: usize,
+        mut done: bool,
+    ) -> apperr::Result<()> {
+        let mut pivot_buffer = [const { MaybeUninit::<u16>::uninit() }; 4096];
+
+        let mut c = icu::Converter::new(&mut pivot_buffer, self.encoding, "UTF-8")?;
+
+        let mut first_chunk = &buf[..first_chunk_len];
+        while !first_chunk.is_empty() {
+            let off = self.text_length();
+            let gap = self.buffer.allocate_gap(off, 8 * 1024, 0);
+            let (input_advance, mut output_advance) = c.convert(first_chunk, gap)?;
+
+            // Remove the BOM from the file, if this is the first chunk.
+            // Our caller ensures to only call us once the BOM has been identified,
+            // which means that if there's a BOM it must be wholly contained in this chunk.
+            if off == 0 {
+                let written = &mut gap[..output_advance];
+                if written.starts_with(b"\xEF\xBB\xBF") {
+                    written.copy_within(3.., 0);
+                    output_advance -= 3;
+                }
+            }
+
+            self.buffer.commit_gap(output_advance);
+            first_chunk = &first_chunk[input_advance..];
+        }
+
+        let mut buf_len = 0;
+
+        loop {
+            if !done {
+                let read = file.read(&mut buf[buf_len..])?;
+                buf_len += read;
+                done = read == 0;
+            }
+
+            let flush = done && buf_len == 0;
+            let gap = self.buffer.allocate_gap(self.text_length(), 8 * 1024, 0);
+            let (input_advance, output_advance) = c.convert(&buf[..buf_len], gap)?;
+
+            self.buffer.commit_gap(output_advance);
+            buf_len -= input_advance;
+            buf.copy_within(input_advance.., 0);
+
+            if flush {
+                break;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Writes the text buffer contents to a file, handling BOM and encoding.
+    pub fn write_file(&mut self, path: &Path) -> apperr::Result<()> {
+        // TODO: Write to a temp file and do an atomic rename.
+        let mut file = File::create(path)?;
+        let mut offset = 0;
+
+        if self.encoding.starts_with("UTF-8") {
+            if self.encoding == "UTF-8 BOM" {
+                file.write_all(b"\xEF\xBB\xBF")?;
+            }
+            loop {
+                let chunk = self.read_forward(offset);
+                if chunk.is_empty() {
+                    break;
+                }
+                file.write_all(chunk)?;
+                offset += chunk.len();
+            }
+        } else {
+            self.write_file_with_icu(file)?;
+        }
+
+        self.mark_as_clean();
+        Ok(())
+    }
+
+    fn write_file_with_icu(&mut self, mut file: File) -> apperr::Result<()> {
+        let mut pivot_buffer = [const { MaybeUninit::<u16>::uninit() }; 4096];
+        #[allow(invalid_value)]
+        let mut buf: [u8; 4096] = unsafe { MaybeUninit::uninit().assume_init() };
+        let mut c = icu::Converter::new(&mut pivot_buffer, "UTF-8", self.encoding)?;
+        let mut offset = 0;
+
+        // Write the BOM for the encodings we know need it.
+        if self.encoding.starts_with("UTF-16")
+            || self.encoding.starts_with("UTF-32")
+            || self.encoding == "gb18030"
+        {
+            let (_, output_advance) = c.convert(b"\xEF\xBB\xBF", &mut buf)?;
+            file.write_all(&buf[..output_advance])?;
+        }
+
+        loop {
+            let chunk = self.read_forward(offset);
+            if chunk.is_empty() {
+                break;
+            }
+
+            let (input_advance, output_advance) = c.convert(chunk, &mut buf)?;
+            file.write_all(&buf[..output_advance])?;
+            offset += input_advance;
+        }
+
+        Ok(())
+    }
+
+    pub fn selection_update_visual(&mut self, visual_pos: Point) {
+        let cursor = self.cursor;
+        self.set_cursor_for_selection(self.cursor_move_to_visual_internal(cursor, visual_pos));
+
+        match &mut self.selection {
+            TextBufferSelection::None | TextBufferSelection::Done { .. } => {
+                self.selection = TextBufferSelection::Active {
+                    beg: cursor.logical_pos,
+                    end: self.cursor.logical_pos,
+                };
+            }
+            TextBufferSelection::Active { beg: _, end } => {
+                *end = self.cursor.logical_pos;
+            }
+        }
+    }
+
+    pub fn selection_update_logical(&mut self, logical_pos: Point) {
+        let cursor = self.cursor;
+        self.set_cursor_for_selection(self.cursor_move_to_logical_internal(cursor, logical_pos));
+
+        match &mut self.selection {
+            TextBufferSelection::None | TextBufferSelection::Done { .. } => {
+                self.selection = TextBufferSelection::Active {
+                    beg: cursor.logical_pos,
+                    end: self.cursor.logical_pos,
+                };
+            }
+            TextBufferSelection::Active { beg: _, end } => {
+                *end = self.cursor.logical_pos;
+            }
+        }
+    }
+
+    pub fn selection_update_delta(&mut self, granularity: CursorMovement, delta: CoordType) {
+        let cursor = self.cursor;
+        self.set_cursor_for_selection(self.cursor_move_delta_internal(cursor, granularity, delta));
+
+        match &mut self.selection {
+            TextBufferSelection::None | TextBufferSelection::Done { .. } => {
+                self.selection = TextBufferSelection::Active {
+                    beg: cursor.logical_pos,
+                    end: self.cursor.logical_pos,
+                };
+            }
+            TextBufferSelection::Active { beg: _, end } => {
+                *end = self.cursor.logical_pos;
+            }
+        }
+    }
+
+    pub fn select_word(&mut self) {
+        // TODO: Something is wrong about this. Try the string "</sup> in the"
+        // and double click on the "i" (= the cursor is in front of the "i").
+        // It'll select "sup> in" but should only select 1 word of course.
+        // Not sure what the issue is, but I think this approach is wrong in general.
+        let beg = self.cursor_move_delta_internal(self.cursor, CursorMovement::Word, -1);
+        let end = self.cursor_move_delta_internal(beg, CursorMovement::Word, 1);
+        self.set_cursor_for_selection(end);
+        self.selection = TextBufferSelection::Done {
+            beg: beg.logical_pos,
+            end: end.logical_pos,
+        };
+    }
+
+    pub fn selection_finalize(&mut self) {
+        if let TextBufferSelection::Active { beg, end } = self.selection {
+            self.selection = TextBufferSelection::Done { beg, end };
+        }
+    }
+
+    pub fn select_all(&mut self) {
+        let beg = ucd::UcdCursor::default();
+        let end = self.cursor_move_to_logical_internal(beg, Point::MAX);
+        self.set_cursor_for_selection(end);
+        self.selection = TextBufferSelection::Done {
+            beg: beg.logical_pos,
+            end: end.logical_pos,
+        };
+    }
+
+    pub fn clear_selection(&mut self) -> bool {
+        let had_selection = self.selection.is_some();
+        self.selection = TextBufferSelection::None;
+        had_selection
+    }
+
+    pub fn find_and_select(&mut self, pattern: &str, options: SearchOptions) -> apperr::Result<()> {
+        if let Some(search) = &mut self.search {
+            if search.pattern != pattern || search.options != options {
+                self.search = None;
+            }
+        }
+
+        if self.search.is_none() {
+            let mut pattern = Cow::Borrowed(pattern);
+            let mut flags = icu::Regex::MULTILINE;
+
+            if !options.match_case {
+                flags |= icu::Regex::CASE_INSENSITIVE;
+            }
+            if options.whole_word {
+                pattern = Cow::Owned(format!(r"\b(?:{})\b", pattern));
+            }
+            if !options.use_regex {
+                flags |= icu::Regex::LITERAL;
+            }
+
+            let text = unsafe { icu::Text::new(self)? };
+            let regex = unsafe { icu::Regex::new(&pattern, flags, &text)? };
+            let mut search = ActiveSearch {
+                pattern: pattern.to_string(),
+                options,
+                text,
+                regex,
+                at_start: self.cursor.offset == 0,
+                no_matches: false,
+            };
+            if self.cursor.offset != 0 {
+                search.regex.reset(self.cursor.offset);
+            }
+            self.search = Some(search);
+        }
+
+        let search = self.search.as_mut().unwrap();
+        if search.no_matches {
+            return Ok(());
+        }
+
+        // If we hit the end of the buffer, and we know that there's something to find,
+        // start the search again from the beginning (= wrap around).
+        let mut hit = search.regex.next();
+        if hit.is_none() && !search.at_start {
+            search.at_start = true;
+            search.regex.reset(0);
+            hit = search.regex.next();
+        }
+
+        if let Some(range) = hit {
+            search.at_start = false;
+
+            let beg = self.cursor_move_to_offset_internal(self.cursor, range.start);
+            let end = self.cursor_move_to_offset_internal(beg, range.end);
+
+            self.set_cursor_internal(end);
+            self.make_cursor_visible();
+
+            self.selection = TextBufferSelection::Done {
+                beg: beg.logical_pos,
+                end: end.logical_pos,
+            };
+        } else {
+            // Avoid searching through the entire document again if we know there's nothing to find.
+            search.no_matches = true;
+        }
+
+        Ok(())
+    }
+
+    fn measurement_config(&self) -> ucd::MeasurementConfig {
+        ucd::MeasurementConfig::new(&self.buffer)
+            .with_word_wrap_column(self.word_wrap_column)
+            .with_tab_size(self.tab_size)
+    }
+
+    fn goto_line_start(&self, mut cursor: ucd::UcdCursor, y: CoordType) -> ucd::UcdCursor {
+        let cursor_before = cursor;
+        let mut seek_to_line_start = true;
+
+        if y > cursor.logical_pos.y {
+            while y > cursor.logical_pos.y {
+                let chunk = self.read_forward(cursor.offset);
+                if chunk.is_empty() {
+                    break;
+                }
+
+                let (delta, line) = ucd::newlines_forward(chunk, 0, cursor.logical_pos.y, y);
+                cursor.offset += delta;
+                cursor.logical_pos.y = line;
+            }
+
+            // If we're at the end of the buffer, we could either be there because the last
+            // character in the buffer is genuinely a newline, or because the buffer ends in a
+            // line of text without trailing newline. The only way to make sure is to seek
+            // backwards to the line start again. But otherwise we can skip that.
+            seek_to_line_start =
+                cursor.offset == self.text_length() && cursor.offset != cursor_before.offset;
+        }
+
+        if seek_to_line_start {
+            loop {
+                let chunk = self.read_backward(cursor.offset);
+                if chunk.is_empty() {
+                    break;
+                }
+
+                let (delta, line) =
+                    ucd::newlines_backward(chunk, chunk.len(), cursor.logical_pos.y, y);
+                cursor.offset -= chunk.len() - delta;
+                cursor.logical_pos.y = line;
+                if delta > 0 {
+                    break;
+                }
+            }
+        }
+
+        if cursor.offset == cursor_before.offset {
+            return cursor;
+        }
+
+        cursor.logical_pos.x = 0;
+        cursor.visual_pos.x = 0;
+        cursor.visual_pos.y = cursor.logical_pos.y;
+        cursor.column = 0;
+
+        if self.word_wrap_column != CoordType::MAX {
+            let mut cursor_top = cursor_before;
+            let mut cursor_bottom = cursor;
+            let upward = cursor_top.offset > cursor_bottom.offset;
+
+            if upward {
+                mem::swap(&mut cursor_top, &mut cursor_bottom);
+            }
+
+            let cursor_end = self
+                .measurement_config()
+                .with_cursor(cursor_top)
+                .goto_logical(cursor_bottom.logical_pos);
+
+            let mut delta = cursor_end.visual_pos.y - cursor_top.visual_pos.y;
+            if upward {
+                delta = -delta;
+            }
+
+            cursor.visual_pos.y = cursor_before.visual_pos.y + delta;
+        }
+
+        cursor
+    }
+
+    fn cursor_move_to_offset_internal(
+        &self,
+        mut cursor: ucd::UcdCursor,
+        offset: usize,
+    ) -> ucd::UcdCursor {
+        while offset < cursor.offset {
+            cursor = self.cursor_move_to_logical_internal(
+                cursor,
+                Point {
+                    x: 0,
+                    y: cursor.logical_pos.y - 1,
+                },
+            );
+        }
+
+        self.measurement_config()
+            .with_cursor(cursor)
+            .goto_offset(offset)
+    }
+
+    fn cursor_move_to_logical_internal(
+        &self,
+        mut cursor: ucd::UcdCursor,
+        pos: Point,
+    ) -> ucd::UcdCursor {
+        let x = pos.x.max(0);
+        let y = pos.y.max(0);
+
+        // goto_line_start() is very fast for seeking across lines. But we don't need that
+        // of course if the `y` didn't actually change. The only exception is if we're
+        // moving leftward in the same line as there's no read_backward() for that.
+        if y != cursor.logical_pos.y || x < cursor.logical_pos.x {
+            cursor = self.goto_line_start(cursor, y);
+        }
+
+        self.measurement_config()
+            .with_cursor(cursor)
+            .goto_logical(Point { x, y })
+    }
+
+    fn cursor_move_to_visual_internal(
+        &self,
+        mut cursor: ucd::UcdCursor,
+        pos: Point,
+    ) -> ucd::UcdCursor {
+        let x = pos.x.max(0);
+        let y = pos.y.max(0);
+
+        if self.word_wrap_column == CoordType::MAX {
+            // goto_line_start() is very fast for seeking across lines. But we don't need that
+            // of course if the `y` didn't actually change. The only exception is if we're
+            // moving leftward in the same line as there's no read_backward() for that.
+            if y < cursor.visual_pos.y || (y == cursor.visual_pos.y && x < cursor.visual_pos.x) {
+                cursor = self.goto_line_start(cursor, y);
+            }
+        } else {
+            // Since we don't store how many visual lines each logical line spans,
+            // we have to iterate line by line and check each time if we're there yet.
+            // We can skip that for forward seeking, since measure_forward() will handle that.
+
+            if y < cursor.visual_pos.y || (y == cursor.visual_pos.y && x < cursor.visual_pos.x) {
+                cursor = self.goto_line_start(cursor, cursor.logical_pos.y);
+            }
+
+            while y < cursor.visual_pos.y {
+                cursor = self.cursor_move_to_logical_internal(
+                    cursor,
+                    Point {
+                        x: 0,
+                        y: cursor.logical_pos.y - 1,
+                    },
+                );
+            }
+        }
+
+        self.measurement_config()
+            .with_cursor(cursor)
+            .goto_visual(Point { x, y })
+    }
+
+    fn cursor_move_delta_internal(
+        &self,
+        mut cursor: ucd::UcdCursor,
+        granularity: CursorMovement,
+        mut delta: CoordType,
+    ) -> ucd::UcdCursor {
+        if delta == 0 {
+            return cursor;
+        }
+
+        let sign = if delta > 0 { 1 } else { -1 };
+
+        match granularity {
+            CursorMovement::Grapheme => {
+                let start_x = if delta > 0 { 0 } else { CoordType::MAX };
+
+                loop {
+                    let target_x = cursor.logical_pos.x + delta;
+
+                    cursor = self.cursor_move_to_logical_internal(
+                        cursor,
+                        Point {
+                            x: target_x,
+                            y: cursor.logical_pos.y,
+                        },
+                    );
+
+                    // We can stop if we ran out of remaining delta
+                    // (or perhaps ran past the goal; in either case the sign would've changed),
+                    // or if we hit the beginning or end of the buffer.
+                    delta = target_x - cursor.logical_pos.x;
+                    if delta.signum() != sign
+                        || (delta < 0 && cursor.offset == 0)
+                        || (delta > 0 && cursor.offset >= self.text_length())
+                    {
+                        break;
+                    }
+
+                    cursor = self.cursor_move_to_logical_internal(
+                        cursor,
+                        Point {
+                            x: start_x,
+                            y: cursor.logical_pos.y + sign,
+                        },
+                    );
+
+                    // We crossed a newline which counts for 1 grapheme cluster.
+                    // So, we also need to run the same check again.
+                    delta -= sign;
+                    if delta.signum() != sign
+                        || cursor.offset == 0
+                        || cursor.offset >= self.text_length()
+                    {
+                        break;
+                    }
+                }
+            }
+            CursorMovement::Word => {
+                let doc = &self.buffer as &dyn Document;
+                let mut offset = self.cursor.offset;
+
+                while delta != 0 {
+                    if delta < 0 {
+                        offset = ucd::word_backward(doc, offset);
+                    } else {
+                        offset = ucd::word_forward(doc, offset);
+                    }
+                    delta -= sign;
+                }
+
+                cursor = self.cursor_move_to_offset_internal(cursor, offset);
+            }
+        }
+
+        cursor
+    }
+
+    fn cursor_move_to_offset(&mut self, offset: usize) {
+        self.set_cursor(self.cursor_move_to_offset_internal(self.cursor, offset))
+    }
+
+    pub fn cursor_move_to_logical(&mut self, pos: Point) {
+        self.set_cursor(self.cursor_move_to_logical_internal(self.cursor, pos))
+    }
+
+    pub fn cursor_move_to_visual(&mut self, pos: Point) {
+        self.set_cursor(self.cursor_move_to_visual_internal(self.cursor, pos))
+    }
+
+    pub fn cursor_move_delta(&mut self, granularity: CursorMovement, delta: CoordType) {
+        self.set_cursor(self.cursor_move_delta_internal(self.cursor, granularity, delta))
+    }
+
+    fn set_cursor(&mut self, cursor: ucd::UcdCursor) {
+        self.set_cursor_internal(cursor);
+        self.last_history_type = HistoryType::CursorMovement;
+        self.selection = TextBufferSelection::None;
+    }
+
+    fn set_cursor_for_selection(&mut self, cursor: ucd::UcdCursor) {
+        self.set_cursor_internal(cursor);
+        self.last_history_type = HistoryType::CursorMovement;
+    }
+
+    fn set_cursor_internal(&mut self, cursor: ucd::UcdCursor) {
+        debug_assert!(
+            cursor.offset <= self.text_length()
+                && cursor.logical_pos.x >= 0
+                && cursor.logical_pos.y >= 0
+                && cursor.logical_pos.y <= self.stats.logical_lines
+                && cursor.visual_pos.x >= 0
+                && cursor.visual_pos.x <= self.word_wrap_column
+                && cursor.visual_pos.y >= 0
+                && cursor.visual_pos.y <= self.stats.visual_lines
+        );
+        self.cursor = cursor;
+    }
+
+    fn extract_raw(&self, mut beg: usize, mut end: usize, out: &mut Vec<u8>, mut out_off: usize) {
+        debug_assert!(beg <= end && end <= self.text_length());
+        end = end.min(self.text_length());
+        beg = beg.min(end);
+        if beg >= end {
+            return;
+        }
+
+        out.reserve(end - beg);
+
+        while beg < end {
+            let chunk = self.read_forward(beg);
+            let chunk = &chunk[..chunk.len().min(end - beg)];
+            helpers::vec_insert_at(out, out_off, chunk);
+            beg += chunk.len();
+            out_off += chunk.len();
+        }
+    }
+
+    /// Extracts a rectangular region of the text buffer and writes it to the framebuffer.
+    /// The `destination` rect is framebuffer coordinates. The extracted region within this
+    /// text buffer has the given `origin` and the same size as the `destination` rect.
+    pub fn render(
+        &mut self,
+        origin: Point,
+        destination: Rect,
+        show_cursor: bool,
+        fb: &mut Framebuffer,
+    ) {
+        if destination.is_empty() {
+            return;
+        }
+
+        let width = destination.width();
+        let height = destination.height();
+        let line_number_width = self.margin_width.max(3) as usize - 3;
+        let text_width = width - self.margin_width;
+        let mut visualizer_buf = [0xE2, 0x90, 0x80]; // U+2400 in UTF8
+        let mut line = String::new();
+        let mut cursor = self.cursor_for_rendering.unwrap_or(self.cursor);
+
+        let [selection_beg, selection_end] = match self.selection {
+            TextBufferSelection::None => [Point::MIN, Point::MIN],
+            TextBufferSelection::Active { beg, end } | TextBufferSelection::Done { beg, end } => {
+                helpers::minmax(beg, end)
+            }
+        };
+
+        line.reserve(width as usize * 2);
+
+        for y in 0..height {
+            line.clear();
+
+            let visual_line = origin.y + y;
+            let mut cursor_beg = self.cursor_move_to_visual_internal(
+                cursor,
+                Point {
+                    x: origin.x,
+                    y: visual_line,
+                },
+            );
+            let cursor_end = self.cursor_move_to_visual_internal(
+                cursor_beg,
+                Point {
+                    x: origin.x + text_width,
+                    y: visual_line,
+                },
+            );
+
+            // Accelerate the next render pass by remembering where we started off.
+            if y == 0 {
+                self.cursor_for_rendering = Some(cursor_beg);
+            }
+
+            if line_number_width != 0 {
+                if (self.word_wrap_column == CoordType::MAX || cursor_beg.logical_pos.x == 0)
+                    && visual_line < self.stats.visual_lines
+                {
+                    _ = write!(
+                        line,
+                        "{:1$} │ ",
+                        cursor_beg.logical_pos.y + 1,
+                        line_number_width
+                    );
+                } else {
+                    // Place "    | " at the beginning of the line.
+                    // Since we know that we won't see line numbers greater than i64::MAX (9223372036854775807)
+                    // any time soon, we can use a static string as the template (`MARGIN`) and slice it,
+                    // because `line_number_width` can't possibly be larger than 19.
+                    let off = 19 - line_number_width;
+                    unsafe { std::hint::assert_unchecked(off < MARGIN_TEMPLATE.len()) };
+                    line.push_str(&MARGIN_TEMPLATE[off..]);
+                }
+            }
+
+            // Nothing to do if the entire line is empty.
+            if cursor_beg.offset != cursor_end.offset {
+                // If we couldn't reach the left edge, we may have stopped short due to a wide glyph.
+                // In that case we'll try to find the next character and then compute by how many
+                // columns it overlaps the left edge (can be anything between 1 and 7).
+                if cursor_beg.visual_pos.x < origin.x {
+                    let cursor_next = self.cursor_move_to_logical_internal(
+                        cursor_beg,
+                        Point {
+                            x: cursor_beg.logical_pos.x + 1,
+                            y: cursor_beg.logical_pos.y,
+                        },
+                    );
+
+                    if cursor_next.visual_pos.x > origin.x {
+                        let overlap = cursor_next.visual_pos.x - origin.x;
+                        debug_assert!((1..=7).contains(&overlap));
+                        line.push_str(&TAB_WHITESPACE[..overlap as usize]);
+                        cursor_beg = cursor_next;
+                    }
+                }
+
+                fn find_control_char(text: &[u8], mut offset: usize) -> usize {
+                    while offset < text.len() && (text[offset] >= 0x20 && text[offset] != 0x7f) {
+                        offset += 1;
+                    }
+                    offset
+                }
+
+                let mut global_off = cursor_beg.offset;
+                let mut cursor_tab = cursor_beg;
+
+                while global_off < cursor_end.offset {
+                    let chunk = self.read_forward(global_off);
+                    let chunk = &chunk[..chunk.len().min(cursor_end.offset - global_off)];
+
+                    let mut chunk_off = 0;
+                    while chunk_off < chunk.len() {
+                        let beg = chunk_off;
+                        chunk_off = find_control_char(chunk, beg);
+
+                        for chunk in chunk[beg..chunk_off].utf8_chunks() {
+                            if !chunk.valid().is_empty() {
+                                line.push_str(chunk.valid());
+                            }
+                            if !chunk.invalid().is_empty() {
+                                line.push('\u{FFFD}');
+                            }
+                        }
+
+                        while chunk_off < chunk.len()
+                            && (chunk[chunk_off] < 0x20 || chunk[chunk_off] == 0x7f)
+                        {
+                            let ch = chunk[chunk_off];
+                            chunk_off += 1;
+
+                            if ch == b'\t' {
+                                cursor_tab = self.cursor_move_to_offset_internal(
+                                    cursor_tab,
+                                    global_off + chunk_off - 1,
+                                );
+                                let tab_size = self.tab_size - (cursor_tab.column % self.tab_size);
+                                line.push_str(&TAB_WHITESPACE[..tab_size as usize]);
+
+                                // Since we know that we just aligned ourselves to the next tab stop,
+                                // we can trivially process any successive tabs.
+                                while chunk_off < chunk.len() && chunk[chunk_off] == b'\t' {
+                                    line.push_str(&TAB_WHITESPACE[..self.tab_size as usize]);
+                                    chunk_off += 1;
+                                }
+                                continue;
+                            }
+
+                            visualizer_buf[2] = if ch == 0x7F {
+                                0xA1 // U+2421
+                            } else {
+                                0x80 | ch // 0x00..=0x1F => U+2400..=U+241F
+                            };
+                            // Our manually constructed UTF8 is never going to be invalid. Trust.
+                            line.push_str(unsafe { str::from_utf8_unchecked(&visualizer_buf) });
+                        }
+                    }
+
+                    global_off += chunk.len();
+                }
+            }
+
+            fb.replace_text(
+                destination.top + y,
+                destination.left,
+                destination.right,
+                &line,
+            );
+
+            // Draw the selection on this line, if any.
+            if cursor_beg.logical_pos < selection_end && cursor_end.logical_pos > selection_beg {
+                // By default, we assume the entire line is selected.
+                let mut beg = 0;
+                let mut end = COORD_TYPE_SAFE_MAX;
+                let mut cursor = cursor_beg;
+
+                // The start of the selection is within this line. We need to update selection_beg.
+                if selection_beg > cursor_beg.logical_pos && selection_beg <= cursor_end.logical_pos
+                {
+                    cursor = self.cursor_move_to_logical_internal(cursor, selection_beg);
+                    beg = cursor.visual_pos.x;
+                    debug_assert_eq!(cursor.visual_pos.y, cursor_beg.visual_pos.y);
+                }
+
+                // The end of the selection is within this line. We need to update selection_end.
+                if selection_end > cursor_beg.logical_pos && selection_end <= cursor_end.logical_pos
+                {
+                    cursor = self.cursor_move_to_logical_internal(cursor, selection_end);
+                    end = cursor.visual_pos.x;
+                    debug_assert_eq!(cursor.visual_pos.y, cursor_beg.visual_pos.y);
+                }
+
+                beg = beg.max(origin.x);
+                end = end.min(origin.x + text_width);
+
+                let left = destination.left + self.margin_width - origin.x;
+                let top = destination.top + y;
+                let rect = Rect {
+                    left: left + beg,
+                    top,
+                    right: left + end,
+                    bottom: top + 1,
+                };
+
+                fb.blend_bg(rect, fb.indexed(IndexedColor::DefaultForeground));
+                fb.blend_fg(rect, fb.indexed(IndexedColor::DefaultBackground));
+            }
+
+            cursor = cursor_end;
+        }
+
+        // Colorize the margin that we wrote above.
+        if self.margin_width > 0 {
+            let margin = Rect {
+                left: destination.left,
+                top: destination.top,
+                right: destination.left + self.margin_width,
+                bottom: destination.bottom,
+            };
+            fb.blend_fg(margin, 0x7f7f7f7f);
+        }
+
+        if self.ruler > 0 && self.ruler < CoordType::MAX {
+            let left = destination.left + self.margin_width + (self.ruler - origin.x).max(0);
+            let right = destination.right;
+            if left < right {
+                fb.blend_bg(
+                    Rect {
+                        left,
+                        top: destination.top,
+                        right,
+                        bottom: destination.bottom,
+                    },
+                    fb.indexed(IndexedColor::BrightRed) & 0x1fffffff,
+                );
+            }
+        }
+
+        if show_cursor {
+            let text = Rect {
+                left: destination.left + self.margin_width,
+                top: destination.top,
+                right: destination.right,
+                bottom: destination.bottom,
+            };
+            let cursor = Point {
+                x: self.cursor.visual_pos.x - origin.x + destination.left + self.margin_width,
+                y: self.cursor.visual_pos.y - origin.y + destination.top,
+            };
+            if text.contains(cursor) {
+                fb.set_cursor(cursor, self.overtype);
+            }
+        }
+    }
+
+    /// Inserts `text` at the current cursor position.
+    ///
+    /// If there's a current selection, it will be replaced.
+    /// The selection is cleared after the call.
+    pub fn write(&mut self, text: &[u8]) {
+        if text.is_empty() {
+            return;
+        }
+
+        if self.selection.is_some() {
+            if let Some((beg, end)) = self.extract_selection_range() {
+                self.edit_begin(HistoryType::Write, beg);
+                self.edit_delete(end);
+                self.selection = TextBufferSelection::None;
+            }
+        }
+        if self.active_edit_depth <= 0 {
+            self.edit_begin(HistoryType::Write, self.cursor);
+        }
+
+        let mut offset = 0;
+        let mut newline_buffer = String::new();
+
+        loop {
+            let (offset_next, _) = ucd::newlines_forward(text, offset, 0, 1);
+
+            let mut line = &text[offset..offset_next];
+            // Trim trailing LF or CRLF, if any.
+            if line.ends_with(b"\n") {
+                line = &line[..line.len() - 1]
+            }
+            if line.ends_with(b"\r") {
+                line = &line[..line.len() - 1]
+            }
+
+            let column_before = self.cursor.logical_pos.x;
+
+            // Write the contents of the line into the buffer.
+            let mut line_off = 0;
+            while line_off < line.len() {
+                // Split the line into chunks of non-tabs and tabs.
+                let mut plain = line;
+                if !self.indent_with_tabs {
+                    let end = memchr2(b'\t', b'\t', line, line_off);
+                    plain = &line[line_off..end];
+                }
+
+                // Non-tabs are written as-is, because the outer loop already handles newline translation.
+                self.edit_write(plain);
+                line_off += plain.len();
+
+                // Now replace tabs with spaces.
+                while line_off < line.len() && line[line_off] == b'\t' {
+                    let spaces = self.tab_size - (self.cursor.column % self.tab_size);
+                    let spaces = &TAB_WHITESPACE.as_bytes()[..spaces as usize];
+                    self.edit_write(spaces);
+                    line_off += 1;
+                }
+            }
+
+            if self.overtype {
+                let delete = self.cursor.logical_pos.x - column_before;
+                let end = self.cursor_move_to_logical_internal(
+                    self.cursor,
+                    Point {
+                        x: self.cursor.logical_pos.x + delete,
+                        y: self.cursor.logical_pos.y,
+                    },
+                );
+                self.edit_delete(end);
+            }
+
+            offset += line.len();
+            if offset >= text.len() {
+                break;
+            }
+
+            // We'll give the next line the same indentation as the previous one.
+            // This block figures out how much that is. We can't reuse that value,
+            // because "  a\n  a\n" should give the 3rd line a total indentation of 4.
+            // Assuming your terminal has bracketed paste, this won't be a concern though.
+            // (If it doesn't, use a different terminal.)
+            let tab_size = self.tab_size as usize;
+            let mut newline_indentation = 0usize;
+            {
+                let line_beg = self.goto_line_start(self.cursor, self.cursor.logical_pos.y);
+                let limit = self.cursor.offset;
+                let mut off = line_beg.offset;
+
+                'outer: while off < limit {
+                    let chunk = self.read_forward(off);
+                    let chunk = &chunk[..chunk.len().min(limit - off)];
+
+                    for &c in chunk {
+                        if c == b' ' {
+                            newline_indentation += 1;
+                        } else if c == b'\t' {
+                            newline_indentation += tab_size - (newline_indentation % tab_size);
+                        } else {
+                            break 'outer;
+                        }
+                    }
+
+                    off += chunk.len();
+                }
+            }
+
+            // First, write the newline.
+            newline_buffer.clear();
+            newline_buffer.push_str(if self.newlines_are_crlf { "\r\n" } else { "\n" });
+
+            // If tabs are enabled, add as many tabs as we can.
+            if self.indent_with_tabs {
+                let tab_count = newline_indentation / tab_size;
+                helpers::string_append_repeat(&mut newline_buffer, '\t', tab_count);
+                newline_indentation -= tab_count * tab_size;
+            }
+
+            // If tabs are disabled, or if the indentation wasn't a multiple of the tab size,
+            // add spaces to make up the difference.
+            helpers::string_append_repeat(&mut newline_buffer, ' ', newline_indentation);
+
+            self.edit_write(newline_buffer.as_bytes());
+
+            offset = offset_next;
+            if offset >= text.len() {
+                break;
+            }
+        }
+
+        self.edit_end();
+    }
+
+    /// Deletes 1 grapheme cluster from the buffer.
+    /// `cursor_movements` is expected to be -1 for backspace and 1 for delete.
+    /// If there's a current selection, it will be deleted and `cursor_movements` ignored.
+    /// The selection is cleared after the call.
+    /// Deletes characters from the buffer based on a delta from the cursor.
+    pub fn delete(&mut self, granularity: CursorMovement, delta: CoordType) {
+        debug_assert!(delta == -1 || delta == 1);
+
+        let beg;
+        let end;
+
+        if self.selection.is_some() {
+            (beg, end) = match self.extract_selection_range() {
+                Some(v) => v,
+                None => return,
+            };
+            self.selection = TextBufferSelection::None;
+        } else {
+            if (delta == -1 && self.cursor.offset == 0)
+                || (delta == 1 && self.cursor.offset >= self.text_length())
+            {
+                // Nothing to delete.
+                return;
+            }
+
+            beg = self.cursor;
+            end = self.cursor_move_delta_internal(beg, granularity, delta);
+            if beg.offset == end.offset {
+                return;
+            }
+        }
+
+        self.edit_begin(HistoryType::Delete, beg);
+        self.edit_delete(end);
+        self.edit_end();
+    }
+
+    /// Extracts a chunk of text or a line if no selection is active. May optionally delete it.
+    pub fn extract_selection(&mut self, delete: bool) -> Vec<u8> {
+        let Some((beg, end)) = self.extract_selection_range() else {
+            return Vec::new();
+        };
+
+        let mut out = Vec::new();
+        self.extract_raw(beg.offset, end.offset, &mut out, 0);
+
+        if delete && !out.is_empty() {
+            self.edit_begin(HistoryType::Delete, beg);
+            self.edit_delete(end);
+            self.edit_end();
+            self.selection = TextBufferSelection::None;
+        }
+
+        out
+    }
+
+    fn extract_selection_range(&self) -> Option<(ucd::UcdCursor, ucd::UcdCursor)> {
+        let (beg, end) = match self.selection {
+            TextBufferSelection::None => {
+                // If there's no selection, editors commonly copy the current line.
+                (
+                    Point {
+                        x: 0,
+                        y: self.cursor.logical_pos.y,
+                    },
+                    Point {
+                        x: 0,
+                        y: self.cursor.logical_pos.y + 1,
+                    },
+                )
+            }
+            TextBufferSelection::Active { beg, end } | TextBufferSelection::Done { beg, end } => {
+                (beg.min(end), beg.max(end))
+            }
+        };
+
+        let beg = self.cursor_move_to_logical_internal(self.cursor, beg);
+        let end = self.cursor_move_to_logical_internal(beg, end);
+
+        if beg.offset < end.offset {
+            Some((beg, end))
+        } else {
+            None
+        }
+    }
+
+    fn edit_begin(&mut self, history_type: HistoryType, cursor: ucd::UcdCursor) {
+        self.active_edit_depth += 1;
+        if self.active_edit_depth > 1 {
+            return;
+        }
+
+        let cursor_before = self.cursor;
+        self.set_cursor_internal(cursor);
+
+        // If both the last and this are a Write operation, we skip allocating a new undo history item.
+        if !(self.last_history_type == HistoryType::Write && history_type == HistoryType::Write)
+            && !(self.last_history_type == HistoryType::Delete
+                && history_type == HistoryType::Delete)
+        {
+            self.redo_stack.clear();
+            while self.undo_stack.len() > 1000 {
+                self.undo_stack.pop_front();
+            }
+
+            self.last_history_type = history_type;
+            self.active_edit_off = cursor.offset;
+            self.undo_stack.push_back(HistoryEntry {
+                cursor_before: cursor_before.logical_pos,
+                selection_before: self.selection,
+                stats_before: self.stats,
+                generation_before: self.buffer.generation,
+                cursor: cursor.logical_pos,
+                deleted: Vec::new(),
+                added: Vec::new(),
+            });
+        }
+
+        // If word-wrap is enabled, the visual layout of all logical lines affected by the write
+        // may have changed. This includes even text before the insertion point up to the line
+        // start, because this write may have joined with a word before the initial cursor.
+        // See other uses of `word_wrap_cursor_next_line` in this function.
+        if self.word_wrap_column != CoordType::MAX {
+            let safe_start = self.goto_line_start(cursor_before, cursor_before.logical_pos.y);
+            let next_line = self.cursor_move_to_logical_internal(
+                cursor_before,
+                Point {
+                    x: 0,
+                    y: cursor_before.logical_pos.y + 1,
+                },
+            );
+            self.active_edit_line_info = Some(ActiveEditLineInfo {
+                safe_start,
+                line_height_in_rows: next_line.visual_pos.y - safe_start.visual_pos.y,
+                distance_next_line_start: next_line.offset - cursor_before.offset,
+            });
+        }
+    }
+
+    fn edit_write(&mut self, text: &[u8]) {
+        let logical_y_before = self.cursor.logical_pos.y;
+
+        // Copy the written portion into the undo entry.
+        {
+            let undo = self.get_last_undo_mut();
+            undo.added.extend_from_slice(text);
+        }
+
+        // Write!
+        {
+            let gap = self
+                .buffer
+                .allocate_gap(self.active_edit_off, text.len(), 0);
+            gap.copy_from_slice(text);
+            self.buffer.commit_gap(text.len());
+        }
+
+        // Move self.cursor to the end of the newly written text. Can't use `self.set_cursor_internal`,
+        // because we're still in the progress of recalculating the line stats.
+        self.active_edit_off += text.len();
+        self.cursor = self.cursor_move_to_offset_internal(self.cursor, self.active_edit_off);
+        self.stats.logical_lines += self.cursor.logical_pos.y - logical_y_before;
+    }
+
+    fn edit_delete(&mut self, to: ucd::UcdCursor) {
+        let logical_y_before = self.cursor.logical_pos.y;
+        let backward = to.offset < self.active_edit_off;
+        let [beg, end] = helpers::minmax(self.active_edit_off, to.offset);
+
+        // Copy the deleted portion into the undo entry.
+        {
+            let undo = self.get_last_undo_mut();
+            let deleted = trust_me_bro::this_lifetime_change_is_totally_safe_mut(&mut undo.deleted);
+            self.extract_raw(beg, end, deleted, if backward { 0 } else { deleted.len() });
+        }
+
+        // Delete the portion from the buffer by enlarging the gap.
+        {
+            let count = end - beg;
+            self.buffer.allocate_gap(beg, 0, count);
+            self.buffer.commit_gap(0);
+        }
+
+        // Move self.cursor to the beginning of the deleted text.
+        // This is only relevant for backward deletions.
+        if backward {
+            let undo = self.get_last_undo_mut();
+            undo.cursor = to.logical_pos;
+            self.cursor = to;
+        }
+
+        self.active_edit_off = beg;
+        self.stats.logical_lines += logical_y_before - to.logical_pos.y;
+    }
+
+    fn edit_end(&mut self) {
+        self.active_edit_depth -= 1;
+        assert!(self.active_edit_depth >= 0);
+        if self.active_edit_depth > 0 {
+            return;
+        }
+
+        #[cfg(debug_assertions)]
+        {
+            let entry = self.get_last_undo_mut();
+            debug_assert!(!entry.deleted.is_empty() || !entry.added.is_empty());
+        }
+
+        if let Some(info) = self.active_edit_line_info.take() {
+            let entry = self.get_last_undo_mut();
+            let deleted_count = entry.deleted.len();
+            let target = self.cursor.logical_pos;
+
+            // From our safe position we can measure the actual visual position of the cursor.
+            self.set_cursor_internal(self.cursor_move_to_logical_internal(info.safe_start, target));
+
+            // If content is added at the insertion position, that's not a problem:
+            // We can just remeasure the height of this one line and calculate the delta.
+            // `deleted_count` is 0 in this case.
+            //
+            // The problem is when content is deleted, because it may affect lines
+            // beyond the end of the `next_line`. In that case we have to measure
+            // the entire buffer contents until the end to compute `self.stats.visual_lines`.
+            if deleted_count < info.distance_next_line_start {
+                // Now we can measure how many more visual rows this logical line spans.
+                let next_line = self.cursor_move_to_logical_internal(
+                    self.cursor,
+                    Point {
+                        x: 0,
+                        y: target.y + 1,
+                    },
+                );
+                let lines_before = info.line_height_in_rows;
+                let lines_after = next_line.visual_pos.y - info.safe_start.visual_pos.y;
+                self.stats.visual_lines += lines_after - lines_before;
+            } else {
+                let end = self.cursor_move_to_logical_internal(self.cursor, Point::MAX);
+                self.stats.visual_lines = end.visual_pos.y + 1;
+            }
+        } else {
+            // If word-wrap is disabled the visual line count always matches the logical one.
+            self.stats.visual_lines = self.stats.logical_lines;
+        }
+
+        self.search = None;
+
+        // Also takes care of clearing `cursor_for_rendering`.
+        self.reflow(false);
+    }
+
+    pub fn undo(&mut self) {
+        let undo_stack =
+            trust_me_bro::this_lifetime_change_is_totally_safe_mut(&mut self.undo_stack);
+        let redo_stack =
+            trust_me_bro::this_lifetime_change_is_totally_safe_mut(&mut self.redo_stack);
+        self.undo_redo(undo_stack, redo_stack);
+    }
+
+    pub fn redo(&mut self) {
+        let redo_stack =
+            trust_me_bro::this_lifetime_change_is_totally_safe_mut(&mut self.redo_stack);
+        let undo_stack =
+            trust_me_bro::this_lifetime_change_is_totally_safe_mut(&mut self.undo_stack);
+        self.undo_redo(redo_stack, undo_stack);
+    }
+
+    fn get_last_undo_mut(&mut self) -> &mut HistoryEntry {
+        self.undo_stack.back_mut().expect("undo_stack is empty")
+    }
+
+    fn undo_redo(
+        &mut self,
+        from: &mut LinkedList<HistoryEntry>,
+        to: &mut LinkedList<HistoryEntry>,
+    ) {
+        let len = from.len();
+        if len == 0 {
+            return;
+        }
+
+        let mut tail = from.split_off(len - 1);
+        to.append(&mut tail);
+        let change = to.back_mut().unwrap();
+
+        // Undo: Whatever was deleted is now added and vice versa.
+        mem::swap(&mut change.deleted, &mut change.added);
+
+        // Move to the point where the modification took place.
+        let cursor = self.cursor_move_to_logical_internal(self.cursor, change.cursor);
+
+        let safe_cursor = if self.word_wrap_column != CoordType::MAX {
+            // If word-wrap is enabled, we need to move the cursor to the beginning of the line.
+            // This is because the undo/redo operation may have changed the visual position of the cursor.
+            self.goto_line_start(cursor, cursor.logical_pos.y)
+        } else {
+            cursor
+        };
+
+        // Delete the inserted portion and reinsert the deleted portion.
+        {
+            let deleted = change.deleted.len();
+            let added = &change.added[..];
+            let gap = self
+                .buffer
+                .allocate_gap(cursor.offset, added.len(), deleted);
+            gap.copy_from_slice(added);
+            self.buffer.commit_gap(added.len());
+        }
+
+        // Restore the previous line statistics.
+        mem::swap(&mut self.stats, &mut change.stats_before);
+
+        // Restore the previous selection.
+        mem::swap(&mut self.selection, &mut change.selection_before);
+
+        // Pretend as if the buffer was never modified.
+        mem::swap(&mut self.buffer.generation, &mut change.generation_before);
+
+        // Restore the previous cursor.
+        let cursor_before = self.cursor_move_to_logical_internal(safe_cursor, change.cursor_before);
+        change.cursor_before = self.cursor.logical_pos;
+        self.set_cursor_internal(cursor_before);
+
+        if self.undo_stack.is_empty() {
+            self.last_history_type = HistoryType::None;
+        }
+    }
+
+    pub fn read_backward(&self, off: usize) -> &[u8] {
+        self.buffer.read_backward(off)
+    }
+
+    pub fn read_forward(&self, off: usize) -> &[u8] {
+        self.buffer.read_forward(off)
+    }
+}
+
+enum BackingBuffer {
+    VirtualMemory(*mut u8, usize),
+    Vec(Vec<u8>),
+}
+
+impl Drop for BackingBuffer {
+    fn drop(&mut self) {
+        unsafe {
+            if let BackingBuffer::VirtualMemory(ptr, reserve) = *self {
+                sys::virtual_release(ptr, reserve);
+            }
+        }
+    }
+}
+
+/// Most people know how Vec<T> works: It has some spare capacity at the end,
+/// so that pushing into it doesn't reallocate every single time. A gap buffer
+/// is the same thing, but the spare capacity can be anywhere in the buffer.
+/// This variant is optimized for large buffers and uses virtual memory.
+pub struct GapBuffer {
+    /// Pointer to the buffer.
+    text: *mut u8,
+    /// Maximum size of the buffer, including gap.
+    reserve: usize,
+    /// Size of the buffer, including gap.
+    commit: usize,
+    /// Length of the stored text, NOT including gap.
+    text_length: usize,
+    /// Gap offset.
+    gap_off: usize,
+    /// Gap length.
+    gap_len: usize,
+    /// Increments every time the buffer is modified.
+    generation: u32,
+    /// If `Vec(..)`, the buffer is optimized for small amounts of text
+    /// and uses the standard heap. Otherwise, it uses virtual memory.
+    buffer: BackingBuffer,
+}
+
+impl GapBuffer {
+    fn new(small: bool) -> apperr::Result<Self> {
+        const RESERVE: usize = 2 * 1024 * 1024 * 1024;
+
+        let buffer;
+        let text;
+
+        if small {
+            let mut v = Vec::new();
+            text = v.as_mut_ptr();
+            buffer = BackingBuffer::Vec(v);
+        } else {
+            text = unsafe { sys::virtual_reserve(RESERVE)? };
+            buffer = BackingBuffer::VirtualMemory(text, RESERVE);
+        }
+
+        Ok(Self {
+            text,
+            reserve: RESERVE,
+            commit: 0,
+            text_length: 0,
+            gap_off: 0,
+            gap_len: 0,
+            generation: 0,
+            buffer,
+        })
+    }
+
+    fn len(&self) -> usize {
+        self.text_length
+    }
+
+    fn allocate_gap(&mut self, off: usize, len: usize, delete: usize) -> &mut [u8] {
+        const LARGE_ALLOC_CHUNK: usize = 64 * 1024;
+        const LARGE_GAP_CHUNK: usize = 4 * 1024;
+        const SMALL_ALLOC_CHUNK: usize = 256;
+        const SMALL_GAP_CHUNK: usize = 16;
+
+        // Sanitize parameters
+        let off = off.min(self.text_length);
+        let delete = delete.min(self.text_length - off);
+
+        // Move the existing gap if it exists
+        if off != self.gap_off {
+            let gap_off = self.gap_off;
+            let gap_len = self.gap_len;
+
+            if gap_len > 0 {
+                //
+                //                       v gap_off
+                // left:  |ABCDEFGHIJKLMN   OPQRSTUVWXYZ|
+                //        |ABCDEFGHI   JKLMNOPQRSTUVWXYZ|
+                //                  ^ off
+                //        move: GLMNET
+                //
+                //                       v gap_off
+                // !left: |ABCDEFGHIJKLMN   OPQRSTUVWXYZ|
+                //        |ABCDEFGHIJKLMNOPQRS   TUVWXYZ|
+                //                            ^ off
+                //        move: OPPOSERS
+                //
+                let data = self.text;
+                let left = off < gap_off;
+                let move_src = if left { off } else { gap_off + gap_len };
+                let move_dst = if left { off + gap_len } else { gap_off };
+                let move_len = if left { gap_off - off } else { off - gap_off };
+
+                unsafe { ptr::copy(data.add(move_src), data.add(move_dst), move_len) };
+
+                if cfg!(debug_assertions) {
+                    unsafe { slice::from_raw_parts_mut(data.add(off), gap_len).fill(0xCD) };
+                }
+            }
+
+            self.gap_off = off;
+        }
+
+        // Delete the text
+        if cfg!(debug_assertions) {
+            unsafe {
+                slice::from_raw_parts_mut(self.text.add(off + self.gap_len), delete).fill(0xCD)
+            };
+        }
+        self.gap_len += delete;
+        self.text_length -= delete;
+
+        // Enlarge the gap if needed
+        if len > self.gap_len {
+            let gap_chunk;
+            let alloc_chunk;
+
+            if matches!(self.buffer, BackingBuffer::VirtualMemory(..)) {
+                gap_chunk = LARGE_GAP_CHUNK;
+                alloc_chunk = LARGE_ALLOC_CHUNK;
+            } else {
+                gap_chunk = SMALL_GAP_CHUNK;
+                alloc_chunk = SMALL_ALLOC_CHUNK;
+            }
+
+            let gap_len_old = self.gap_len;
+            let gap_len_new = (len + gap_chunk + gap_chunk - 1) & !(gap_chunk - 1);
+            let bytes_old = self.commit;
+            let bytes_new = self.text_length + gap_len_new;
+
+            if bytes_new > bytes_old {
+                let bytes_new = (bytes_new + alloc_chunk - 1) & !(alloc_chunk - 1);
+                assert!(bytes_new <= self.reserve);
+
+                match &mut self.buffer {
+                    BackingBuffer::VirtualMemory(ptr, _) => unsafe {
+                        sys::virtual_commit(ptr.add(bytes_old), bytes_new - bytes_old).expect("OOM")
+                    },
+                    BackingBuffer::Vec(v) => {
+                        v.resize(bytes_new, 0);
+                        self.text = v.as_mut_ptr();
+                    }
+                }
+
+                self.commit = bytes_new;
+            }
+
+            let gap_beg = unsafe { self.text.add(off) };
+            unsafe {
+                ptr::copy(
+                    gap_beg.add(gap_len_old),
+                    gap_beg.add(gap_len_new),
+                    self.text_length - off,
+                )
+            };
+
+            if cfg!(debug_assertions) {
+                unsafe {
+                    slice::from_raw_parts_mut(gap_beg.add(gap_len_old), gap_len_new - gap_len_old)
+                        .fill(0xCD)
+                };
+            }
+
+            self.gap_len = gap_len_new;
+        }
+
+        self.generation = self.generation.wrapping_add(1);
+        unsafe { slice::from_raw_parts_mut(self.text.add(off), len) }
+    }
+
+    fn commit_gap(&mut self, len: usize) {
+        assert!(len <= self.gap_len);
+        self.text_length += len;
+        self.gap_off += len;
+        self.gap_len -= len;
+    }
+
+    fn clear(&mut self) {
+        self.gap_off = 0;
+        self.gap_len += self.text_length;
+        self.generation = self.generation.wrapping_add(1);
+        self.text_length = 0;
+    }
+
+    /// Replaces the entire buffer contents with the given `text`.
+    /// The method is optimized for the case where the given `text` already matches
+    /// the existing contents. Returns `true` if the buffer contents were changed.
+    fn copy_from_str(&mut self, text: &str) -> bool {
+        let input = text.as_bytes();
+        let max_common = self.text_length.min(input.len());
+        let mut common = 0;
+
+        // Find the position at which the contents change.
+        while common < max_common {
+            let chunk = self.read_forward(common);
+            let cmp_len = chunk.len().min(max_common - common);
+
+            if chunk[..cmp_len] != input[common..common + cmp_len] {
+                // Find the first differing byte.
+                common += chunk[..cmp_len]
+                    .iter()
+                    .zip(&input[common..common + cmp_len])
+                    .position(|(&a, &b)| a != b)
+                    .unwrap_or(cmp_len);
+                break;
+            }
+
+            common += cmp_len;
+        }
+
+        // If the contents are identical, we're done.
+        if common == self.text_length && common == input.len() {
+            return false;
+        }
+
+        // Update the buffer from the first differing byte.
+        let new = &input[common..];
+        let gap = self.allocate_gap(common, new.len(), self.text_length - common);
+        gap.copy_from_slice(new);
+        self.commit_gap(new.len());
+        true
+    }
+
+    /// Copies the contents of the buffer into a string.
+    fn copy_into_string(&self, dst: &mut String) {
+        dst.clear();
+
+        let mut off = 0;
+        while off < self.text_length {
+            let chunk = self.read_forward(off);
+            dst.push_str(&String::from_utf8_lossy(chunk));
+            off += chunk.len();
+        }
+    }
+}
+
+impl Document for GapBuffer {
+    fn read_backward(&self, off: usize) -> &[u8] {
+        let off = off.min(self.text_length);
+        let beg;
+        let len;
+
+        if off <= self.gap_off {
+            // Cursor is before the gap: We can read until the beginning of the buffer.
+            beg = 0;
+            len = off;
+        } else {
+            // Cursor is after the gap: We can read until the end of the gap.
+            beg = self.gap_off + self.gap_len;
+            // The cursor_off doesn't account of the gap_len.
+            // (This allows us to move the gap without recalculating the cursor position.)
+            len = off - self.gap_off;
+        }
+
+        unsafe { slice::from_raw_parts(self.text.add(beg), len) }
+    }
+
+    fn read_forward(&self, off: usize) -> &[u8] {
+        let off = off.min(self.text_length);
+        let beg;
+        let len;
+
+        if off < self.gap_off {
+            // Cursor is before the gap: We can read until the start of the gap.
+            beg = off;
+            len = self.gap_off - off;
+        } else {
+            // Cursor is after the gap: We can read until the end of the buffer.
+            beg = off + self.gap_len;
+            len = self.text_length - off;
+        }
+
+        unsafe { slice::from_raw_parts(self.text.add(beg), len) }
+    }
+}
+
+pub enum Bom {
+    None,
+    UTF8,
+    UTF16LE,
+    UTF16BE,
+    UTF32LE,
+    UTF32BE,
+    GB18030,
+}
+
+const BOM_MAX_LEN: usize = 4;
+
+fn detect_bom(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.len() >= 4 {
+        if bytes.starts_with(b"\xFF\xFE\x00\x00") {
+            return Some("UTF-32LE");
+        }
+        if bytes.starts_with(b"\x00\x00\xFE\xFF") {
+            return Some("UTF-32BE");
+        }
+        if bytes.starts_with(b"\x84\x31\x95\x33") {
+            return Some("gb18030");
+        }
+    }
+    if bytes.len() >= 3 && bytes.starts_with(b"\xEF\xBB\xBF") {
+        return Some("UTF-8");
+    }
+    if bytes.len() >= 2 {
+        if bytes.starts_with(b"\xFF\xFE") {
+            return Some("UTF-16LE");
+        }
+        if bytes.starts_with(b"\xFE\xFF") {
+            return Some("UTF-16BE");
+        }
+    }
+    None
+}

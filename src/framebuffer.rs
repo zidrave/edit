@@ -1,0 +1,536 @@
+use crate::helpers::{CoordType, Point, Rect, Size};
+use crate::{helpers, ucd};
+use std::fmt::Write;
+
+pub enum IndexedColor {
+    Black,
+    Red,
+    Green,
+    Yellow,
+    Blue,
+    Magenta,
+    Cyan,
+    White,
+    BrightBlack,
+    BrightRed,
+    BrightGreen,
+    BrightYellow,
+    BrightBlue,
+    BrightMagenta,
+    BrightCyan,
+    BrightWhite,
+    DefaultBackground,
+    DefaultForeground,
+}
+
+pub const INDEXED_COLORS_COUNT: usize = 18;
+
+pub const DEFAULT_THEME: [u32; INDEXED_COLORS_COUNT] = [
+    0xff000000, 0xff212cbe, 0xff3aae3f, 0xff4a9abe, 0xffbe4d20, 0xffbe54bb, 0xffb2a700, 0xffbebebe,
+    0xff808080, 0xff303eff, 0xff51ea58, 0xff44c9ff, 0xffff6a2f, 0xffff74fc, 0xfff0e100, 0xffffffff,
+    0xff000000, 0xffffffff,
+];
+
+pub struct Framebuffer {
+    indexed_colors: [u32; INDEXED_COLORS_COUNT],
+    size: Size,
+    lines: Vec<String>,
+    bg_bitmap: Vec<u32>,
+    fg_bitmap: Vec<u32>,
+    auto_colors: [u32; 2], // [dark, light]
+    cursor: Point,
+    cursor_overtype: bool,
+}
+
+impl Framebuffer {
+    pub fn new() -> Self {
+        Self {
+            indexed_colors: DEFAULT_THEME,
+            size: Size::default(),
+            lines: Vec::new(),
+            bg_bitmap: Vec::new(),
+            fg_bitmap: Vec::new(),
+            auto_colors: [0, 0],
+            cursor: Point { x: -1, y: -1 },
+            cursor_overtype: false,
+        }
+    }
+
+    pub fn set_indexed_colors(&mut self, colors: [u32; INDEXED_COLORS_COUNT]) {
+        self.indexed_colors = colors;
+
+        self.auto_colors = [
+            self.indexed_colors[IndexedColor::Black as usize],
+            self.indexed_colors[IndexedColor::BrightWhite as usize],
+        ];
+        if !Self::quick_is_dark(self.auto_colors[0]) {
+            self.auto_colors.swap(0, 1);
+        }
+    }
+
+    pub fn reset(&mut self, size: Size) {
+        let width = size.width as usize;
+
+        if size != self.size {
+            let height = size.height as usize;
+            let area = width * height;
+            self.size = size;
+            self.lines = vec![String::new(); height];
+            self.bg_bitmap = vec![0; area];
+            self.fg_bitmap = vec![0; area];
+        }
+
+        let bg = self.indexed_colors[IndexedColor::DefaultBackground as usize];
+        self.bg_bitmap.fill(bg);
+        self.fg_bitmap.fill(0);
+        self.cursor = Point { x: -1, y: -1 };
+
+        for l in &mut self.lines {
+            l.clear();
+            l.reserve(width + width / 2);
+            helpers::string_append_repeat(l, ' ', width);
+        }
+    }
+
+    /// Replaces text contents in a single line of the framebuffer.
+    /// All coordinates are in viewport coordinates.
+    /// Assumes that all tabs have been replaced with spaces.
+    ///
+    /// # Arguments
+    ///
+    /// * `y` - The y-coordinate of the line to replace.
+    /// * `origin_x` - The x-coordinate where the text should be inserted.
+    /// * `clip_right` - The x-coordinate past which the text will be clipped.
+    /// * `text` - The text to insert.
+    ///
+    /// # Returns
+    ///
+    /// The rectangle that was updated.
+    pub fn replace_text(
+        &mut self,
+        y: CoordType,
+        origin_x: CoordType,
+        clip_right: CoordType,
+        text: &str,
+    ) -> Rect {
+        let Some(line) = self.lines.get_mut(y as usize) else {
+            return Rect::default();
+        };
+
+        let bytes = text.as_bytes();
+        let clip_right = clip_right.clamp(0, self.size.width);
+        let layout_width = clip_right - origin_x;
+
+        // Can't insert text that can't fit or is empty.
+        if layout_width <= 0 || bytes.is_empty() {
+            return Rect::default();
+        }
+
+        let mut cfg = ucd::MeasurementConfig::new(&bytes);
+
+        // Check if the text intersects with the left edge of the framebuffer
+        // and figure out the parts that are inside.
+        let mut left = origin_x;
+        if left < 0 {
+            let cursor = cfg.goto_visual(Point { x: -left, y: 0 });
+            left += cursor.visual_pos.x;
+
+            if left < 0 && cursor.offset < text.len() {
+                // `-left` must've intersected a wide glyph. Go to the next one.
+                let cursor = cfg.goto_logical(Point {
+                    x: cursor.logical_pos.x + 1,
+                    y: 0,
+                });
+                left += cursor.visual_pos.x;
+            }
+        }
+
+        // If the text still starts outside the framebuffer, we must've ran out of text above.
+        // Otherwise, if it starts outside the right edge to begin with, we can't insert it anyway.
+        if left < 0 || left >= clip_right {
+            return Rect::default();
+        }
+
+        // Measure the width of the new text (= `res_new.visual_target.x`).
+        let res_new = cfg.goto_visual(Point {
+            x: layout_width,
+            y: 0,
+        });
+
+        // Figure out at which byte offset the new text gets inserted.
+        let right = left + res_new.visual_pos.x;
+        let line_bytes = line.as_bytes();
+        let mut cfg_old = ucd::MeasurementConfig::new(&line_bytes);
+        let res_old_beg = cfg_old.goto_visual(Point { x: left, y: 0 });
+        let res_old_end = cfg_old.goto_visual(Point { x: right, y: 0 });
+
+        // If we intersect a wide glyph, we need to pad the new text with spaces.
+        let mut str_new = &text[..res_new.offset];
+        let mut str_buf = String::new();
+        let overlap_beg = res_old_beg.visual_pos.x - left;
+        let overlap_end = right - res_old_end.visual_pos.x;
+        if overlap_beg > 0 || overlap_end > 0 {
+            if overlap_beg > 0 {
+                helpers::string_append_repeat(&mut str_buf, ' ', overlap_beg as usize);
+            }
+            str_buf.push_str(str_new);
+            if overlap_end > 0 {
+                helpers::string_append_repeat(&mut str_buf, ' ', overlap_end as usize);
+            }
+            str_new = &str_buf;
+        }
+
+        (*line).replace_range(res_old_beg.offset..res_old_end.offset, str_new);
+
+        Rect {
+            left,
+            top: y,
+            right,
+            bottom: y + 1,
+        }
+    }
+
+    pub fn draw_scrollbar(
+        &mut self,
+        clip_rect: Rect,
+        track: Rect,
+        content_offset: CoordType,
+        content_height: CoordType,
+    ) {
+        if track.is_empty() {
+            return;
+        }
+
+        let viewport_height = track.height();
+        // The content height is at least the viewport height.
+        let content_height = content_height.max(viewport_height);
+        // The content offset must be at least one viewport height from the bottom.
+        // You don't want to scroll past the end after all...
+        let content_offset = content_offset.clamp(0, content_height - viewport_height);
+
+        // In order to increase the visual resolution of the scrollbar,
+        // we'll use 1/8th blocks to represent the thumb.
+        // First, scale the offsets to get that 1/8th resolution.
+        let viewport_height = viewport_height as i64 * 8;
+        let content_offset = content_offset as i64 * 8;
+        let content_height = content_height as i64 * 8;
+
+        // The proportional thumb height (0-1) is the fraction of viewport and
+        // content height. The taller the content, the smaller the thumb:
+        // = viewport_height / content_height
+        //
+        // We then scale that to the viewport height to get the height in 1/8th units.
+        // = viewport_height * viewport_height / content_height
+        //
+        // We add content_height/2 to round the integer division, which results in a numerator of:
+        // = viewport_height * viewport_height + content_height / 2
+        //
+        // Finally we add +1 to round up the division if `content_height` is uneven. This ensures that
+        // in case of a rounding issue, we'll make the track too large and clamp it to the track size.
+        let thumb_numerator = viewport_height * viewport_height + content_height / 2 + 1;
+        let thumb_height = thumb_numerator / content_height;
+        // Ensure the thumb has a minimum size of 1 row.
+        let thumb_height = thumb_height.max(8);
+
+        // The proportional thumb top position (0-1) is naturally:
+        // = content_offset / content_height
+        //
+        // The bottom position is 1 viewport-height below the top position:
+        // = (viewport_height + content_offset) / content_height
+        //
+        // Since everything must be scaled to the 1/8th units we must multiply by viewport_height:
+        // = viewport_height * (viewport_height + content_offset) / content_height
+        // = viewport_height * viewport_height + viewport_height * content_offset / content_height
+        //
+        // And we also want that rounded integer division as before. This transforms the
+        // `viewport_height * viewport_height` portion into the `thumb_enumerator` above.
+        // = thumb_numerator + viewport_height * content_offset / content_height
+        //
+        let thumb_bottom = (viewport_height * content_offset + thumb_numerator) / content_height;
+        // Now that the bottom is flush with the bottom of the track, we can calculate the top.
+        let thumb_top = (thumb_bottom - thumb_height).max(0);
+
+        // Calculate the height of the top/bottom cell of the thumb.
+        let top_fract = (thumb_top % 8) as CoordType;
+        let bottom_fract = (thumb_bottom % 8) as CoordType;
+
+        // Shift to absolute coordinates.
+        let thumb_top = ((thumb_top + 7) / 8) as CoordType + track.top;
+        let thumb_bottom = (thumb_bottom / 8) as CoordType + track.top;
+
+        let track_clipped = track.intersect(clip_rect);
+
+        // Clamp to the visible area.
+        let thumb_top_clipped = thumb_top.max(track_clipped.top);
+        let thumb_bottom_clipped = thumb_bottom.min(track_clipped.bottom);
+
+        self.blend_bg(track_clipped, self.indexed(IndexedColor::BrightBlack));
+        self.blend_fg(track_clipped, self.indexed(IndexedColor::BrightWhite));
+
+        // Draw the full blocks.
+        for y in thumb_top_clipped..thumb_bottom_clipped {
+            self.replace_text(y, track_clipped.left, track_clipped.right, "█");
+        }
+
+        // Draw the top/bottom cell of the thumb.
+        // U+2581 to U+2588, 1/8th block to 8/8th block elements glyphs: ▁▂▃▄▅▆▇█
+        // In UTF8: E2 96 81 to E2 96 88
+        let mut fract_buf = [0xE2, 0x96, 0x88];
+        if top_fract != 0 {
+            fract_buf[2] = (0x88 - top_fract) as u8;
+            self.replace_text(
+                thumb_top_clipped - 1,
+                track_clipped.left,
+                track_clipped.right,
+                unsafe { std::str::from_utf8_unchecked(&fract_buf) },
+            );
+        }
+        if bottom_fract != 0 {
+            fract_buf[2] = (0x88 - bottom_fract) as u8;
+            let rect = self.replace_text(
+                thumb_bottom_clipped,
+                track_clipped.left,
+                track_clipped.right,
+                unsafe { std::str::from_utf8_unchecked(&fract_buf) },
+            );
+            self.blend_bg(rect, self.indexed(IndexedColor::BrightWhite));
+            self.blend_fg(rect, self.indexed(IndexedColor::BrightBlack));
+        }
+    }
+
+    #[inline]
+    pub fn indexed(&self, index: IndexedColor) -> u32 {
+        self.indexed_colors[index as usize]
+    }
+
+    /// Blends a background color over the given rectangular area.
+    pub fn blend_bg(&mut self, target: Rect, bg: u32) {
+        Self::alpha_blend_rect(&mut self.bg_bitmap[..], target, self.size, bg);
+    }
+
+    /// Blends a foreground color over the given rectangular area.
+    pub fn blend_fg(&mut self, target: Rect, fg: u32) {
+        if fg != 0 {
+            Self::alpha_blend_rect(&mut self.fg_bitmap[..], target, self.size, fg);
+        } else {
+            self.blend_rect_auto(target);
+        }
+    }
+
+    /// Performs alpha blending on a rectangle inside the destination bitmap.
+    fn alpha_blend_rect(dst: &mut [u32], rect: Rect, size: Size, src: u32) {
+        let width = size.width;
+        let height = size.height;
+        let left = rect.left.clamp(0, width);
+        let right = rect.right.clamp(0, width);
+        let top = rect.top.clamp(0, height);
+        let bottom = rect.bottom.clamp(0, height);
+
+        if left >= right || top >= bottom {
+            return;
+        }
+
+        if (src & 0xff000000) == 0xff000000 {
+            for y in top..bottom {
+                let beg = (y * width + left) as usize;
+                let end = (y * width + right) as usize;
+                dst[beg..end].fill(src);
+            }
+        } else if (src & 0xff000000) != 0x00000000 {
+            for y in top..bottom {
+                let beg = (y * width + left) as usize;
+                let end = (y * width + right) as usize;
+                let mut off = beg;
+
+                while {
+                    let color = dst[off];
+
+                    // Chunk into runs of the same color, so that we only call alpha_blend once per run.
+                    let chunk_beg = off;
+                    while {
+                        off += 1;
+                        off < end && dst[off] == color
+                    } {}
+                    let chunk_end = off;
+
+                    let color = Self::mix(color, src, 1.0, 1.0);
+                    dst[chunk_beg..chunk_end].fill(color);
+
+                    off < end
+                } {}
+            }
+        }
+    }
+
+    fn blend_rect_auto(&mut self, rect: Rect) {
+        let width = self.size.width;
+        let height = self.size.height;
+        let left = rect.left.clamp(0, width);
+        let right = rect.right.clamp(0, width);
+        let top = rect.top.clamp(0, height);
+        let bottom = rect.bottom.clamp(0, height);
+
+        if left >= right || top >= bottom {
+            return;
+        }
+
+        for y in top..bottom {
+            let beg = (y * width + left) as usize;
+            let end = (y * width + right) as usize;
+            let mut off = beg;
+
+            while {
+                let bg = self.bg_bitmap[off];
+
+                // Chunk into runs of the same color, so that we only call Self::quick_is_dark once per run.
+                let chunk_beg = off;
+                while {
+                    off += 1;
+                    off < end && self.bg_bitmap[off] == bg
+                } {}
+                let chunk_end = off;
+
+                let fg = self.auto_colors[Self::quick_is_dark(bg) as usize];
+                self.fg_bitmap[chunk_beg..chunk_end].fill(fg);
+
+                off < end
+            } {}
+        }
+    }
+
+    fn mix(dst: u32, src: u32, dst_balance: f32, src_balance: f32) -> u32 {
+        let src_r = Self::srgb_to_linear(src & 0xff);
+        let src_g = Self::srgb_to_linear((src >> 8) & 0xff);
+        let src_b = Self::srgb_to_linear((src >> 16) & 0xff);
+        let src_a = (src >> 24) as f32 / 255.0f32;
+        let src_a = src_a * dst_balance;
+
+        let dst_r = Self::srgb_to_linear(dst & 0xff);
+        let dst_g = Self::srgb_to_linear((dst >> 8) & 0xff);
+        let dst_b = Self::srgb_to_linear((dst >> 16) & 0xff);
+        let dst_a = (dst >> 24) as f32 / 255.0f32;
+        let dst_a = dst_a * src_balance;
+
+        let out_a = src_a + dst_a * (1.0f32 - src_a);
+        let out_r = (src_r * src_a + dst_r * dst_a * (1.0f32 - src_a)) / out_a;
+        let out_g = (src_g * src_a + dst_g * dst_a * (1.0f32 - src_a)) / out_a;
+        let out_b = (src_b * src_a + dst_b * dst_a * (1.0f32 - src_a)) / out_a;
+
+        (((out_a * 255.0f32) as u32) << 24)
+            | (Self::linear_to_srgb(out_b) << 16)
+            | (Self::linear_to_srgb(out_g) << 8)
+            | Self::linear_to_srgb(out_r)
+    }
+
+    fn srgb_to_linear(c: u32) -> f32 {
+        let fc = c as f32 / 255.0f32;
+        if fc <= 0.04045f32 {
+            fc / 12.92f32
+        } else {
+            ((fc + 0.055f32) / 1.055f32).powf(2.4f32)
+        }
+    }
+
+    fn linear_to_srgb(c: f32) -> u32 {
+        if c <= 0.0031308f32 {
+            (c * 12.92f32 * 255.0f32) as u32
+        } else {
+            ((1.055f32 * c.powf(1.0f32 / 2.4f32) - 0.055f32) * 255.0f32) as u32
+        }
+    }
+
+    fn quick_is_dark(c: u32) -> bool {
+        let r = c & 0xff;
+        let g = (c >> 8) & 0xff;
+        let b = (c >> 16) & 0xff;
+        // Rough approximation of the sRGB luminance Y = 0.2126 R + 0.7152 G + 0.0722 B.
+        let l = r * 3 + g * 10 + b;
+        l < 128 * 14
+    }
+
+    pub fn set_cursor(&mut self, pos: Point, overtype: bool) {
+        self.cursor = pos;
+        self.cursor_overtype = overtype;
+    }
+
+    pub fn render(&mut self) -> String {
+        let mut result = String::new();
+        result.push_str("\x1b[H");
+
+        let mut last_bg = self.bg_bitmap[0];
+        let mut last_fg = self.fg_bitmap[0];
+        // Invert the colors to force a color change on the first cell.
+        last_bg ^= 1;
+        last_fg ^= 1;
+
+        for y in 0..self.size.height {
+            if y != 0 {
+                result.push_str("\r\n");
+            }
+
+            let line = &self.lines[y as usize][..];
+            let line_bytes = line.as_bytes();
+            let mut cfg = ucd::MeasurementConfig::new(&line_bytes);
+
+            for x in 0..self.size.width {
+                let bg = self.bg_bitmap[(y * self.size.width + x) as usize];
+                let fg = self.fg_bitmap[(y * self.size.width + x) as usize];
+                if bg == last_bg && fg == last_fg {
+                    continue;
+                }
+
+                if x != 0 {
+                    let beg = cfg.cursor().offset;
+                    let end = cfg.goto_visual(Point { x, y: 0 }).offset;
+                    result.push_str(&line[beg..end]);
+                }
+
+                if last_bg != bg {
+                    last_bg = bg;
+                    _ = write!(
+                        result,
+                        "\x1b[48;2;{};{};{}m",
+                        bg & 0xff,
+                        (bg >> 8) & 0xff,
+                        (bg >> 16) & 0xff
+                    );
+                }
+
+                if last_fg != fg {
+                    last_fg = fg;
+                    _ = write!(
+                        result,
+                        "\x1b[38;2;{};{};{}m",
+                        fg & 0xff,
+                        (fg >> 8) & 0xff,
+                        (fg >> 16) & 0xff
+                    );
+                }
+            }
+
+            result.push_str(&line[cfg.cursor().offset..]);
+        }
+
+        if self.cursor.x >= 0 && self.cursor.y >= 0 {
+            // CUP to the cursor position.
+            // DECSCUSR to set the cursor style.
+            // DECTCEM to show the cursor.
+            _ = write!(
+                result,
+                "\x1b[{};{}H\x1b[{} q\x1b[?25h",
+                self.cursor.y + 1,
+                self.cursor.x + 1,
+                if self.cursor_overtype { 1 } else { 5 }
+            );
+        } else {
+            // DECTCEM to hide the cursor.
+            result.push_str("\x1b[?25l");
+        }
+
+        result
+    }
+}
+
+pub fn mix(dst: u32, src: u32, balance: f32) -> u32 {
+    Framebuffer::mix(dst, src, 1.0 - balance, balance)
+}

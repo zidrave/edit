@@ -1,0 +1,34 @@
+[package]
+name = "edit"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+debug-layout = []
+debug-latency = []
+
+[profile.release]
+codegen-units = 1
+debug = "full"
+lto = true
+panic = "abort"
+debug-assertions = true # Temporary while I test this
+
+[dependencies]
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies.windows-sys]
+version = "0.59"
+features = [
+    "Win32_Globalization",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_IO",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_System_Threading",
+]

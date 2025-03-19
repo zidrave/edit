@@ -1,0 +1,1027 @@
+use crate::buffer::TextBuffer;
+use crate::helpers::DisplayableCString;
+use crate::utf8::Utf8Chars;
+use crate::{apperr, sys};
+use std::ffi::{CStr, CString};
+use std::mem::MaybeUninit;
+use std::ops::Range;
+use std::ptr::{null, null_mut};
+use std::{cmp, mem};
+
+static mut ENCODINGS: Option<Vec<DisplayableCString>> = None;
+
+pub fn get_available_encodings() -> &'static [DisplayableCString] {
+    // OnceCell for people that want to put it into a static.
+    #[allow(static_mut_refs)]
+    unsafe {
+        if ENCODINGS.is_none() {
+            let mut encodings = Vec::new();
+
+            if let Ok(f) = init_if_needed() {
+                let mut n = 0;
+                loop {
+                    let name = (f.ucnv_getAvailableName)(n);
+                    if name.is_null() {
+                        break;
+                    }
+                    encodings.push(DisplayableCString::from_ptr(name));
+                    n += 1;
+                }
+            }
+
+            if encodings.is_empty() {
+                encodings.push(DisplayableCString::new(CString::new("UTF-8").unwrap()));
+            }
+
+            ENCODINGS = Some(encodings);
+        }
+        ENCODINGS.as_ref().unwrap_unchecked().as_slice()
+    }
+}
+
+pub struct Converter<'pivot> {
+    source: *mut icu_ffi::UConverter,
+    target: *mut icu_ffi::UConverter,
+    pivot_buffer: &'pivot mut [MaybeUninit<u16>],
+    pivot_source: *mut u16,
+    pivot_target: *mut u16,
+    reset: bool,
+}
+
+impl Drop for Converter<'_> {
+    fn drop(&mut self) {
+        let f = assume_loaded();
+        unsafe { (f.ucnv_close)(self.source) };
+        unsafe { (f.ucnv_close)(self.target) };
+    }
+}
+
+impl<'pivot> Converter<'pivot> {
+    pub fn new(
+        pivot_buffer: &'pivot mut [MaybeUninit<u16>],
+        source_encoding: &str,
+        target_encoding: &str,
+    ) -> apperr::Result<Self> {
+        let f = init_if_needed()?;
+
+        let source_encoding = Self::append_nul(source_encoding);
+        let target_encoding = Self::append_nul(target_encoding);
+
+        let mut status = icu_ffi::U_ZERO_ERROR;
+        let source = unsafe { (f.ucnv_open)(source_encoding.as_ptr(), &mut status) };
+        let target = unsafe { (f.ucnv_open)(target_encoding.as_ptr(), &mut status) };
+        if status.is_failure() {
+            if !source.is_null() {
+                unsafe { (f.ucnv_close)(source) };
+            }
+            if !target.is_null() {
+                unsafe { (f.ucnv_close)(target) };
+            }
+            return Err(status.as_error());
+        }
+
+        let pivot_source = pivot_buffer.as_mut_ptr() as *mut u16;
+        let pivot_target = unsafe { pivot_source.add(pivot_buffer.len()) };
+
+        Ok(Self {
+            source,
+            target,
+            pivot_buffer,
+            pivot_source,
+            pivot_target,
+            reset: true,
+        })
+    }
+
+    fn append_nul(input: &str) -> String {
+        format!("{}\0", input)
+    }
+
+    pub fn convert(&mut self, input: &[u8], output: &mut [u8]) -> apperr::Result<(usize, usize)> {
+        let f = assume_loaded();
+
+        let input_beg = input.as_ptr();
+        let input_end = unsafe { input_beg.add(input.len()) };
+        let mut input_ptr = input_beg;
+
+        let output_beg = output.as_mut_ptr();
+        let output_end = unsafe { output_beg.add(output.len()) };
+        let mut output_ptr = output_beg;
+
+        let pivot_beg = self.pivot_buffer.as_mut_ptr() as *mut u16;
+        let pivot_end = unsafe { pivot_beg.add(self.pivot_buffer.len()) };
+
+        let flush = input.is_empty();
+        let mut status = icu_ffi::U_ZERO_ERROR;
+
+        unsafe {
+            (f.ucnv_convertEx)(
+                /* target_cnv   */ self.target,
+                /* source_cnv   */ self.source,
+                /* target       */ &mut output_ptr,
+                /* target_limit */ output_end,
+                /* source       */ &mut input_ptr,
+                /* source_limit */ input_end,
+                /* pivot_start  */ pivot_beg,
+                /* pivot_source */ &mut self.pivot_source,
+                /* pivot_target */ &mut self.pivot_target,
+                /* pivot_limit  */ pivot_end,
+                /* reset        */ self.reset,
+                /* flush        */ flush,
+                /* status       */ &mut status,
+            );
+        }
+
+        self.reset = false;
+        if status.is_failure() && status != icu_ffi::U_BUFFER_OVERFLOW_ERROR {
+            return Err(status.as_error());
+        }
+
+        let input_advance = unsafe { input_ptr.offset_from(input_beg) as usize };
+        let output_advance = unsafe { output_ptr.offset_from(output_beg) as usize };
+        Ok((input_advance, output_advance))
+    }
+}
+
+// In benchmarking, I found that the performance does not really change much by changing this value.
+// I picked 64 because it seemed like a reasonable lower bound.
+const CACHE_SIZE: usize = 64;
+
+// Caches a chunk of TextBuffer contents (UTF-8) in UTF-16 format.
+struct Cache {
+    /// The translated text. Contains `len`-many valid items.
+    utf16: [u16; CACHE_SIZE],
+    /// For each character in `utf16` this stores the offset in the `TextBuffer`,
+    /// relative to the start offset stored in `native_beg`.
+    /// This has the same length as `utf16`.
+    utf16_to_utf8_offsets: [u16; CACHE_SIZE],
+    /// `utf8_to_utf16_offsets[native_offset - native_beg]` will tell you which character
+    /// in `utf16` maps to the given `native_offset` in the underlying `TextBuffer`.
+    /// Contains `native_end - native_beg`-many valid items.
+    utf8_to_utf16_offsets: [u16; CACHE_SIZE],
+
+    /// The number of valid items in `utf16`.
+    utf16_len: usize,
+    native_indexing_limit: usize,
+
+    /// The range of UTF-8 text in the `TextBuffer` that this chunk covers.
+    utf8_range: Range<usize>,
+}
+
+struct DoubleCache {
+    cache: [Cache; 2],
+    /// You can consider this a 1 bit index into `cache`.
+    mru: bool,
+}
+
+// I initially did this properly with a PhantomData marker for the TextBuffer lifetime,
+// but it was a pain so now I don't. Not a big deal - its only use is in a self-referential
+// struct in TextBuffer which Rust can't deal with anyway.
+pub struct Text(&'static mut icu_ffi::UText);
+
+impl Drop for Text {
+    fn drop(&mut self) {
+        let f = assume_loaded();
+        unsafe { (f.utext_close)(self.0) };
+    }
+}
+
+impl Text {
+    pub unsafe fn new(tb: &TextBuffer) -> apperr::Result<Self> {
+        let f = init_if_needed()?;
+
+        let mut status = icu_ffi::U_ZERO_ERROR;
+        let ptr =
+            unsafe { (f.utext_setup)(null_mut(), size_of::<DoubleCache>() as i32, &mut status) };
+        if status.is_failure() {
+            return Err(status.as_error());
+        }
+
+        const FUNCS: icu_ffi::UTextFuncs = icu_ffi::UTextFuncs {
+            table_size: size_of::<icu_ffi::UTextFuncs>() as i32,
+            reserved1: 0,
+            reserved2: 0,
+            reserved3: 0,
+            clone: Some(utext_clone),
+            native_length: Some(utext_native_length),
+            access: Some(utext_access),
+            extract: None,
+            replace: None,
+            copy: None,
+            map_offset_to_native: Some(utext_map_offset_to_native),
+            map_native_index_to_utf16: Some(utext_map_native_index_to_utf16),
+            close: None,
+            spare1: None,
+            spare2: None,
+            spare3: None,
+        };
+
+        let ut = unsafe { &mut *ptr };
+        ut.p_funcs = &FUNCS;
+        ut.context = tb as *const TextBuffer as *mut _;
+
+        // ICU unfortunately expects a `UText` instance to have valid contents after construction.
+        utext_access(ut, 0, true);
+
+        Ok(Self(ut))
+    }
+}
+
+fn text_buffer_from_utext<'a>(ut: &icu_ffi::UText) -> &'a TextBuffer {
+    unsafe { &*(ut.context as *const TextBuffer) }
+}
+
+fn double_cache_from_utext<'a>(ut: &icu_ffi::UText) -> &'a mut DoubleCache {
+    unsafe { &mut *(ut.p_extra as *mut DoubleCache) }
+}
+
+extern "C" fn utext_clone(
+    dest: *mut icu_ffi::UText,
+    src: &icu_ffi::UText,
+    deep: bool,
+    status: &mut icu_ffi::UErrorCode,
+) -> *mut icu_ffi::UText {
+    if status.is_failure() {
+        return null_mut();
+    }
+
+    if deep {
+        *status = icu_ffi::U_UNSUPPORTED_ERROR;
+        return null_mut();
+    }
+
+    let f = assume_loaded();
+    let ut_ptr = unsafe { (f.utext_setup)(dest, size_of::<DoubleCache>() as i32, status) };
+    if status.is_failure() {
+        return null_mut();
+    }
+
+    unsafe {
+        let ut = &mut *ut_ptr;
+        let src_double_cache = double_cache_from_utext(src);
+        let dst_double_cache = double_cache_from_utext(ut);
+        let src_cache = &src_double_cache.cache[src_double_cache.mru as usize];
+        let dst_cache = &mut dst_double_cache.cache[dst_double_cache.mru as usize];
+
+        ut.provider_properties = src.provider_properties;
+        ut.chunk_native_limit = src.chunk_native_limit;
+        ut.native_indexing_limit = src.native_indexing_limit;
+        ut.chunk_native_start = src.chunk_native_start;
+        ut.chunk_offset = src.chunk_offset;
+        ut.chunk_length = src.chunk_length;
+        ut.chunk_contents = dst_cache.utf16.as_ptr();
+        ut.p_funcs = src.p_funcs;
+        ut.context = src.context;
+
+        // I wonder if it would make sense to use a Cow here. But probably not.
+        std::ptr::copy_nonoverlapping(src_cache, dst_cache, 1);
+    }
+
+    ut_ptr
+}
+
+extern "C" fn utext_native_length(ut: &mut icu_ffi::UText) -> i64 {
+    let tb = text_buffer_from_utext(ut);
+    tb.text_length() as i64
+}
+
+extern "C" fn utext_access(ut: &mut icu_ffi::UText, native_index: i64, forward: bool) -> bool {
+    let tb = text_buffer_from_utext(ut);
+    let mut index_contained = native_index;
+
+    if !forward {
+        index_contained -= 1;
+    }
+    if index_contained < 0 || index_contained as usize >= tb.text_length() {
+        return false;
+    }
+
+    let index_contained = index_contained as usize;
+    let native_index = native_index as usize;
+
+    let double_cache = double_cache_from_utext(ut);
+
+    for cache in &double_cache.cache {
+        if cache.utf8_range.contains(&index_contained) {
+            ut.chunk_contents = cache.utf16.as_ptr();
+            ut.chunk_length = cache.utf16_len as i32;
+            ut.chunk_offset =
+                cache.utf8_to_utf16_offsets[native_index - cache.utf8_range.start] as i32;
+            ut.chunk_native_start = cache.utf8_range.start as i64;
+            ut.chunk_native_limit = cache.utf8_range.end as i64;
+            ut.native_indexing_limit = cache.native_indexing_limit as i32;
+            return true;
+        }
+    }
+
+    // Turn the least recently used cache into the most recently used one.
+    double_cache.mru = !double_cache.mru;
+    let cache = &mut double_cache.cache[double_cache.mru as usize];
+
+    // In order to safely fit any UTF-8 character into our cache,
+    // we must assume the worst case of a 4-byte long encoding.
+    const UTF16_LEN_LIMIT: usize = CACHE_SIZE - 4;
+    let utf8_len_limit;
+    let native_start;
+
+    if forward {
+        utf8_len_limit = (tb.text_length() - native_index).min(UTF16_LEN_LIMIT);
+        native_start = native_index;
+    } else {
+        // The worst case ratio for UTF-8 to UTF-16 is 1:1, when the text is ASCII.
+        // This allows us to safely subtract the UTF-16 buffer size
+        // and assume that whatever we read as UTF-8 will fit.
+        // TODO: Test what happens if you have lots of invalid UTF-8 text blow up to U+FFFD.
+        utf8_len_limit = native_index.min(UTF16_LEN_LIMIT);
+
+        // Since simply subtracting an offset may end up in the middle of a codepoint sequence,
+        // we must align the offset to the next codepoint boundary.
+        // Here we skip trail bytes until we find a lead.
+        let mut beg = native_index - utf8_len_limit;
+        let chunk = tb.read_forward(beg);
+        for &c in chunk {
+            if c & 0b1100_0000 != 0b1000_0000 {
+                break;
+            }
+            beg += 1;
+        }
+
+        native_start = beg;
+    }
+
+    // Translate the given range from UTF-8 to UTF-16.
+    // NOTE: This code makes the assumption that the `native_index` is always
+    // at UTF-8 codepoint boundaries which technically isn't guaranteed.
+    let mut utf16_len = 0;
+    let mut utf8_len = 0;
+    let mut ascii_len = 0;
+    'outer: loop {
+        let initial_utf8_len = utf8_len;
+        let chunk = tb.read_forward(native_start + utf8_len);
+        if chunk.is_empty() {
+            break;
+        }
+
+        let mut it = Utf8Chars::new(chunk, 0);
+
+        // If we've only seen ASCII so far we can fast-pass the UTF-16 translation,
+        // because we can just widen from u8 -> u16.
+        if utf16_len == ascii_len {
+            let haystack = &chunk[..utf8_len_limit - ascii_len];
+            // When it comes to performance, and the search space is small (which it is here),
+            // it's always a good idea to keep the loops small and tight...
+            let len = haystack
+                .iter()
+                .position(|&c| c >= 0x80)
+                .unwrap_or(haystack.len());
+
+            // ...In this case it allows the compiler to vectorize this loop and double
+            // the performance. Luckily, llvm doesn't unroll the loop, which is great,
+            // because `len` will always be a relatively small number.
+            for &c in &chunk[..len] {
+                unsafe {
+                    *cache.utf16.get_unchecked_mut(ascii_len) = c as u16;
+                    *cache.utf16_to_utf8_offsets.get_unchecked_mut(ascii_len) = ascii_len as u16;
+                    *cache.utf8_to_utf16_offsets.get_unchecked_mut(ascii_len) = ascii_len as u16;
+                }
+                ascii_len += 1;
+            }
+
+            utf16_len += len;
+            utf8_len += len;
+            it.seek(len);
+            if ascii_len >= UTF16_LEN_LIMIT {
+                break;
+            }
+        }
+
+        // TODO: This loop is the slow part of our uregex search. May be worth optimizing.
+        loop {
+            let Some(c) = it.next() else {
+                break;
+            };
+
+            // Thanks to our `if utf16_len >= utf16_limit` check,
+            // we can safely assume that this will fit.
+            unsafe {
+                let utf8_len_beg = utf8_len;
+                let utf8_len_end = initial_utf8_len + it.offset();
+
+                while utf8_len < utf8_len_end {
+                    *cache.utf8_to_utf16_offsets.get_unchecked_mut(utf8_len) = utf16_len as u16;
+                    utf8_len += 1;
+                }
+
+                if c <= '\u{FFFF}' {
+                    *cache.utf16.get_unchecked_mut(utf16_len) = c as u16;
+                    *cache.utf16_to_utf8_offsets.get_unchecked_mut(utf16_len) = utf8_len_beg as u16;
+                    utf16_len += 1;
+                } else {
+                    let c = c as u32 - 0x1_0000;
+                    *cache.utf16.get_unchecked_mut(utf16_len) = (c >> 10) as u16 | 0xD800;
+                    *cache.utf16_to_utf8_offsets.get_unchecked_mut(utf16_len) = utf8_len_beg as u16;
+                    utf16_len += 1;
+                    *cache.utf16.get_unchecked_mut(utf16_len) = (c & 0x3FF) as u16 | 0xDC00;
+                    *cache.utf16_to_utf8_offsets.get_unchecked_mut(utf16_len) = utf8_len_beg as u16;
+                    utf16_len += 1;
+                }
+            }
+
+            if utf16_len >= UTF16_LEN_LIMIT || utf8_len >= utf8_len_limit {
+                break 'outer;
+            }
+        }
+    }
+
+    // Allow for looking up past-the-end indices via
+    // `utext_map_offset_to_native` and `utext_map_native_index_to_utf16`.
+    cache.utf16_to_utf8_offsets[utf16_len] = utf8_len as u16;
+    cache.utf8_to_utf16_offsets[utf8_len] = utf16_len as u16;
+
+    let native_limit = native_index + utf8_len;
+    cache.utf16_len = utf16_len;
+    cache.utf8_range = native_start..native_limit;
+
+    ut.chunk_contents = cache.utf16.as_ptr();
+    ut.chunk_length = cache.utf16_len as i32;
+    ut.chunk_offset = if forward { 0 } else { cache.utf16_len as i32 };
+    ut.chunk_native_start = native_start as i64;
+    ut.chunk_native_limit = native_limit as i64;
+    // If the entire UTF-8 chunk is ASCII, we can tell ICU that it doesn't need to call
+    // utext_map_offset_to_native. For some reason, uregex calls that function *a lot*,
+    // literally half the CPU time is spent on it.
+    ut.native_indexing_limit = ascii_len as i32;
+    true
+}
+
+#[inline(never)]
+fn foo() {}
+
+extern "C" fn utext_map_offset_to_native(ut: &icu_ffi::UText) -> i64 {
+    debug_assert!(ut.chunk_offset >= 0 && ut.chunk_offset <= ut.chunk_length);
+    let double_cache = double_cache_from_utext(ut);
+    let cache = &double_cache.cache[double_cache.mru as usize];
+    let off_rel = cache.utf16_to_utf8_offsets[ut.chunk_offset as usize];
+    let off_abs = cache.utf8_range.start + off_rel as usize;
+    off_abs as i64
+}
+
+extern "C" fn utext_map_native_index_to_utf16(ut: &icu_ffi::UText, native_index: i64) -> i32 {
+    debug_assert!(native_index >= ut.chunk_native_start && native_index <= ut.chunk_native_limit);
+    let double_cache = double_cache_from_utext(ut);
+    let cache = &double_cache.cache[double_cache.mru as usize];
+    let off_rel = cache.utf8_to_utf16_offsets[(native_index - ut.chunk_native_start) as usize];
+    off_rel as i32
+}
+
+// Same reason here for not using a PhantomData marker as with `Text`.
+pub struct Regex(&'static mut icu_ffi::URegularExpression);
+
+impl Drop for Regex {
+    fn drop(&mut self) {
+        let f = assume_loaded();
+        unsafe { (f.uregex_close)(self.0) };
+    }
+}
+
+impl Regex {
+    pub const CASE_INSENSITIVE: i32 = icu_ffi::UREGEX_CASE_INSENSITIVE;
+    pub const MULTILINE: i32 = icu_ffi::UREGEX_MULTILINE;
+    pub const LITERAL: i32 = icu_ffi::UREGEX_LITERAL;
+
+    pub unsafe fn new(pattern: &str, flags: i32, text: &Text) -> apperr::Result<Self> {
+        let f = init_if_needed()?;
+        unsafe {
+            let utf16: Vec<u16> = pattern.encode_utf16().collect();
+            let mut status = icu_ffi::U_ZERO_ERROR;
+
+            let ptr = (f.uregex_open)(
+                utf16.as_ptr(),
+                utf16.len() as i32,
+                icu_ffi::UREGEX_MULTILINE | icu_ffi::UREGEX_ERROR_ON_UNKNOWN_ESCAPES | flags,
+                None,
+                &mut status,
+            );
+            // ICU describes the time unit as being dependent on CPU performance
+            // and "typically [in] the order of milliseconds", but this claim seems
+            // highly outdated. On my CPU from 2021, a limit of 4096 equals roughly 600ms.
+            (f.uregex_setTimeLimit)(ptr, 4096, &mut status);
+            (f.uregex_setStackLimit)(ptr, 4 * 1024 * 1024, &mut status);
+            (f.uregex_setUText)(ptr, text.0 as *const _ as *mut _, &mut status);
+            if status.is_failure() {
+                return Err(status.as_error());
+            }
+
+            Ok(Self(&mut *ptr))
+        }
+    }
+
+    pub fn reset(&mut self, index: usize) {
+        let f = assume_loaded();
+        let mut status = icu_ffi::U_ZERO_ERROR;
+        unsafe { (f.uregex_reset64)(self.0, index as i64, &mut status) };
+    }
+}
+
+impl Iterator for Regex {
+    type Item = Range<usize>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let f = assume_loaded();
+
+        let mut status = icu_ffi::U_ZERO_ERROR;
+        let ok = unsafe { (f.uregex_findNext)(self.0, &mut status) };
+        if !ok {
+            return None;
+        }
+
+        let start = unsafe { (f.uregex_start64)(self.0, 0, &mut status) };
+        let end = unsafe { (f.uregex_end64)(self.0, 0, &mut status) };
+        if status.is_failure() {
+            return None;
+        }
+
+        let start = start.max(0);
+        let end = end.max(start);
+        Some(start as usize..end as usize)
+    }
+}
+
+static mut ROOT_COLLATOR: Option<*mut icu_ffi::UCollator> = None;
+
+pub fn compare_strings(a: &[u8], b: &[u8]) -> cmp::Ordering {
+    // OnceCell for people that want to put it into a static.
+    #[allow(static_mut_refs)]
+    let coll = unsafe {
+        if ROOT_COLLATOR.is_none() {
+            ROOT_COLLATOR = Some(if let Ok(f) = init_if_needed() {
+                let mut status = icu_ffi::U_ZERO_ERROR;
+                (f.ucol_open)(c"".as_ptr(), &mut status)
+            } else {
+                null_mut()
+            })
+        }
+        ROOT_COLLATOR.unwrap_unchecked()
+    };
+
+    if coll.is_null() {
+        a.cmp(b)
+    } else {
+        let f = assume_loaded();
+        let mut status = icu_ffi::U_ZERO_ERROR;
+        let res = unsafe {
+            (f.ucol_strcollUTF8)(
+                coll,
+                a.as_ptr(),
+                a.len() as i32,
+                b.as_ptr(),
+                b.len() as i32,
+                &mut status,
+            )
+        };
+
+        match res {
+            icu_ffi::UCollationResult::UCOL_EQUAL => cmp::Ordering::Equal,
+            icu_ffi::UCollationResult::UCOL_GREATER => cmp::Ordering::Greater,
+            icu_ffi::UCollationResult::UCOL_LESS => cmp::Ordering::Less,
+        }
+    }
+}
+
+static mut ROOT_CASEMAP: Option<*mut icu_ffi::UCaseMap> = None;
+
+pub fn fold_case(input: &str) -> String {
+    // OnceCell for people that want to put it into a static.
+    #[allow(static_mut_refs)]
+    let casemap = unsafe {
+        if ROOT_CASEMAP.is_none() {
+            ROOT_CASEMAP = Some(if let Ok(f) = init_if_needed() {
+                let mut status = icu_ffi::U_ZERO_ERROR;
+                (f.ucasemap_open)(null(), 0, &mut status)
+            } else {
+                null_mut()
+            })
+        }
+        ROOT_CASEMAP.unwrap_unchecked()
+    };
+
+    if !casemap.is_null() {
+        let f = assume_loaded();
+        let mut status = icu_ffi::U_ZERO_ERROR;
+        let mut output = Vec::new();
+        let mut output_len;
+
+        // First, guess the output length:
+        // TODO: What's a good heuristic here?
+        {
+            output.reserve_exact(input.len() + 16);
+            let output = output.spare_capacity_mut();
+            output_len = unsafe {
+                (f.ucasemap_utf8FoldCase)(
+                    casemap,
+                    output.as_mut_ptr() as *mut _,
+                    output.len() as i32,
+                    input.as_ptr() as *const _,
+                    input.len() as i32,
+                    &mut status,
+                )
+            };
+        }
+
+        // If that failed to fit, retry with the correct length.
+        if status == icu_ffi::U_BUFFER_OVERFLOW_ERROR && output_len > 0 {
+            output.reserve_exact(output_len as usize);
+            let output = output.spare_capacity_mut();
+            output_len = unsafe {
+                (f.ucasemap_utf8FoldCase)(
+                    casemap,
+                    output.as_mut_ptr() as *mut _,
+                    output.len() as i32,
+                    input.as_ptr() as *const _,
+                    input.len() as i32,
+                    &mut status,
+                )
+            };
+        }
+
+        if status.is_success() && output_len > 0 {
+            unsafe {
+                output.set_len(output_len as usize);
+            }
+            return unsafe { String::from_utf8_unchecked(output) };
+        }
+    }
+
+    input.to_ascii_lowercase()
+}
+
+#[allow(non_snake_case)]
+struct LibraryFunctions {
+    ucnv_getAvailableName: icu_ffi::ucnv_getAvailableName,
+    ucnv_open: icu_ffi::ucnv_open,
+    ucnv_close: icu_ffi::ucnv_close,
+    ucnv_convertEx: icu_ffi::ucnv_convertEx,
+
+    ucasemap_open: icu_ffi::ucasemap_open,
+    ucasemap_utf8FoldCase: icu_ffi::ucasemap_utf8FoldCase,
+
+    ucol_open: icu_ffi::ucol_open,
+    ucol_strcollUTF8: icu_ffi::ucol_strcollUTF8,
+
+    utext_setup: icu_ffi::utext_setup,
+    utext_close: icu_ffi::utext_close,
+
+    uregex_open: icu_ffi::uregex_open,
+    uregex_close: icu_ffi::uregex_close,
+    uregex_setStackLimit: icu_ffi::uregex_setStackLimit,
+    uregex_setTimeLimit: icu_ffi::uregex_setTimeLimit,
+    uregex_setUText: icu_ffi::uregex_setUText,
+    uregex_reset64: icu_ffi::uregex_reset64,
+    uregex_findNext: icu_ffi::uregex_findNext,
+    uregex_start64: icu_ffi::uregex_start64,
+    uregex_end64: icu_ffi::uregex_end64,
+}
+
+// SAFETY:
+const LIBRARY_FUNCTIONS_NAMES: [&CStr; 19] = [
+    c"ucnv_getAvailableName",
+    c"ucnv_open",
+    c"ucnv_close",
+    c"ucnv_convertEx",
+    //
+    c"ucasemap_open",
+    c"ucasemap_utf8FoldCase",
+    //
+    c"ucol_open",
+    c"ucol_strcollUTF8",
+    //
+    c"utext_setup",
+    c"utext_close",
+    //
+    c"uregex_open",
+    c"uregex_close",
+    c"uregex_setTimeLimit",
+    c"uregex_setStackLimit",
+    c"uregex_setUText",
+    c"uregex_reset64",
+    c"uregex_findNext",
+    c"uregex_start64",
+    c"uregex_end64",
+];
+
+enum LibraryFunctionsState {
+    Uninitialized,
+    Failed,
+    Loaded(LibraryFunctions),
+}
+
+static mut LIBRARY_FUNCTIONS: LibraryFunctionsState = LibraryFunctionsState::Uninitialized;
+
+#[allow(static_mut_refs)]
+fn init_if_needed() -> apperr::Result<&'static LibraryFunctions> {
+    #[cold]
+    fn load() {
+        unsafe {
+            LIBRARY_FUNCTIONS = LibraryFunctionsState::Failed;
+
+            let Ok(icu) = sys::load_icu() else {
+                return;
+            };
+
+            type TransparentFunction = unsafe extern "C" fn() -> *const ();
+
+            // OH NO I'M DOING A BAD THING
+            //
+            // If this assertion hits, you either forgot to update `LIBRARY_FUNCTIONS_NAMES`
+            // or you're on a platform where `dlsym` behaves different from classic UNIX and Windows.
+            //
+            // This code assumes that we can treat the `LibraryFunctions` struct containing various different function
+            // pointers as an array of `TransparentFunction` pointers. In C, this works on any platform that supports
+            // POSIX `dlsym` or equivalent, but I suspect Rust is once again being extra about it. In any case, that's
+            // still better than loading every function one by one, just to blow up our binary size for no reason.
+            const _: () = assert!(
+                mem::size_of::<LibraryFunctions>()
+                    == mem::size_of::<TransparentFunction>() * LIBRARY_FUNCTIONS_NAMES.len()
+            );
+
+            let mut funcs = MaybeUninit::<LibraryFunctions>::uninit();
+            let mut ptr = funcs.as_mut_ptr() as *mut TransparentFunction;
+
+            for name in LIBRARY_FUNCTIONS_NAMES {
+                let Ok(func) = sys::get_proc_address(icu, name) else {
+                    return;
+                };
+                ptr.write(func);
+                ptr = ptr.add(1);
+            }
+
+            LIBRARY_FUNCTIONS = LibraryFunctionsState::Loaded(funcs.assume_init());
+        }
+    }
+
+    unsafe {
+        if matches!(&LIBRARY_FUNCTIONS, LibraryFunctionsState::Uninitialized) {
+            load();
+        }
+    }
+
+    match unsafe { &LIBRARY_FUNCTIONS } {
+        LibraryFunctionsState::Loaded(f) => Ok(f),
+        _ => Err(apperr::APP_ICU_MISSING),
+    }
+}
+
+#[allow(static_mut_refs)]
+fn assume_loaded() -> &'static LibraryFunctions {
+    match unsafe { &LIBRARY_FUNCTIONS } {
+        LibraryFunctionsState::Loaded(f) => f,
+        _ => unreachable!(),
+    }
+}
+
+mod icu_ffi {
+    #![allow(non_camel_case_types)]
+
+    use crate::apperr;
+    use std::ffi::c_char;
+
+    #[derive(Copy, Clone, Eq, PartialEq)]
+    #[repr(transparent)]
+    pub struct UErrorCode(std::os::raw::c_int);
+
+    impl UErrorCode {
+        pub fn is_success(&self) -> bool {
+            self.0 <= 0
+        }
+
+        pub fn is_failure(&self) -> bool {
+            self.0 > 0
+        }
+
+        pub fn as_error(&self) -> apperr::Error {
+            debug_assert!(self.0 > 0);
+            apperr::Error::new_icu(self.0 as u32)
+        }
+    }
+
+    pub const U_ZERO_ERROR: UErrorCode = UErrorCode(0);
+    pub const U_BUFFER_OVERFLOW_ERROR: UErrorCode = UErrorCode(15);
+    pub const U_UNSUPPORTED_ERROR: UErrorCode = UErrorCode(16);
+
+    pub struct UConverter;
+
+    pub type ucnv_getAvailableName = unsafe extern "C" fn(n: i32) -> *mut c_char;
+
+    pub type ucnv_open =
+        unsafe extern "C" fn(converter_name: *const u8, status: &mut UErrorCode) -> *mut UConverter;
+
+    pub type ucnv_close = unsafe extern "C" fn(converter: *mut UConverter);
+
+    pub type ucnv_convertEx = unsafe extern "C" fn(
+        target_cnv: *mut UConverter,
+        source_cnv: *mut UConverter,
+        target: *mut *mut u8,
+        target_limit: *const u8,
+        source: *mut *const u8,
+        source_limit: *const u8,
+        pivot_start: *mut u16,
+        pivot_source: *mut *mut u16,
+        pivot_target: *mut *mut u16,
+        pivot_limit: *const u16,
+        reset: bool,
+        flush: bool,
+        status: &mut UErrorCode,
+    );
+
+    pub struct UCaseMap;
+
+    pub type ucasemap_open = unsafe extern "C" fn(
+        locale: *const c_char,
+        options: u32,
+        status: &mut UErrorCode,
+    ) -> *mut UCaseMap;
+
+    pub type ucasemap_utf8FoldCase = unsafe extern "C" fn(
+        csm: *const UCaseMap,
+        dest: *mut c_char,
+        dest_capacity: i32,
+        src: *const c_char,
+        src_length: i32,
+        status: &mut UErrorCode,
+    ) -> i32;
+
+    #[repr(C)]
+    pub enum UCollationResult {
+        UCOL_EQUAL = 0,
+        UCOL_GREATER = 1,
+        UCOL_LESS = -1,
+    }
+
+    #[repr(C)]
+    pub struct UCollator;
+
+    pub type ucol_open =
+        unsafe extern "C" fn(loc: *const c_char, status: &mut UErrorCode) -> *mut UCollator;
+
+    pub type ucol_strcollUTF8 = unsafe extern "C" fn(
+        coll: *mut UCollator,
+        source: *const u8,
+        source_length: i32,
+        target: *const u8,
+        target_length: i32,
+        status: &mut UErrorCode,
+    ) -> UCollationResult;
+
+    // UText callback functions
+    pub type UTextClone = unsafe extern "C" fn(
+        dest: *mut UText,
+        src: &UText,
+        deep: bool,
+        status: &mut UErrorCode,
+    ) -> *mut UText;
+    pub type UTextNativeLength = unsafe extern "C" fn(ut: &mut UText) -> i64;
+    pub type UTextAccess =
+        unsafe extern "C" fn(ut: &mut UText, native_index: i64, forward: bool) -> bool;
+    pub type UTextExtract = unsafe extern "C" fn(
+        ut: &mut UText,
+        native_start: i64,
+        native_limit: i64,
+        dest: *mut u16,
+        dest_capacity: i32,
+        status: &mut UErrorCode,
+    ) -> i32;
+    pub type UTextReplace = unsafe extern "C" fn(
+        ut: &mut UText,
+        native_start: i64,
+        native_limit: i64,
+        replacement_text: *const u16,
+        replacement_length: i32,
+        status: &mut UErrorCode,
+    ) -> i32;
+    pub type UTextCopy = unsafe extern "C" fn(
+        ut: &mut UText,
+        native_start: i64,
+        native_limit: i64,
+        native_dest: i64,
+        move_text: bool,
+        status: &mut UErrorCode,
+    );
+    pub type UTextMapOffsetToNative = unsafe extern "C" fn(ut: &UText) -> i64;
+    pub type UTextMapNativeIndexToUTF16 =
+        unsafe extern "C" fn(ut: &UText, native_index: i64) -> i32;
+    pub type UTextClose = unsafe extern "C" fn(ut: &mut UText);
+
+    #[repr(C)]
+    pub struct UTextFuncs {
+        pub table_size: i32,
+        pub reserved1: i32,
+        pub reserved2: i32,
+        pub reserved3: i32,
+        pub clone: Option<UTextClone>,
+        pub native_length: Option<UTextNativeLength>,
+        pub access: Option<UTextAccess>,
+        pub extract: Option<UTextExtract>,
+        pub replace: Option<UTextReplace>,
+        pub copy: Option<UTextCopy>,
+        pub map_offset_to_native: Option<UTextMapOffsetToNative>,
+        pub map_native_index_to_utf16: Option<UTextMapNativeIndexToUTF16>,
+        pub close: Option<UTextClose>,
+        pub spare1: Option<UTextClose>,
+        pub spare2: Option<UTextClose>,
+        pub spare3: Option<UTextClose>,
+    }
+
+    #[repr(C)]
+    pub struct UText {
+        pub magic: u32,
+        pub flags: i32,
+        pub provider_properties: i32,
+        pub size_of_struct: i32,
+        pub chunk_native_limit: i64,
+        pub extra_size: i32,
+        pub native_indexing_limit: i32,
+        pub chunk_native_start: i64,
+        pub chunk_offset: i32,
+        pub chunk_length: i32,
+        pub chunk_contents: *const u16,
+        pub p_funcs: &'static UTextFuncs,
+        pub p_extra: *mut std::ffi::c_void,
+        pub context: *mut std::ffi::c_void,
+        pub p: *mut std::ffi::c_void,
+        pub q: *mut std::ffi::c_void,
+        pub r: *mut std::ffi::c_void,
+        pub priv_p: *mut std::ffi::c_void,
+        pub a: i64,
+        pub b: i32,
+        pub c: i32,
+        pub priv_a: i64,
+        pub priv_b: i32,
+        pub priv_c: i32,
+    }
+
+    pub const UTEXT_MAGIC: u32 = 0x345ad82c;
+    pub const UTEXT_PROVIDER_LENGTH_IS_EXPENSIVE: i32 = 1;
+    pub const UTEXT_PROVIDER_STABLE_CHUNKS: i32 = 2;
+    pub const UTEXT_PROVIDER_WRITABLE: i32 = 3;
+    pub const UTEXT_PROVIDER_HAS_META_DATA: i32 = 4;
+    pub const UTEXT_PROVIDER_OWNS_TEXT: i32 = 5;
+
+    pub type utext_setup = unsafe extern "C" fn(
+        ut: *mut UText,
+        extra_space: i32,
+        status: &mut UErrorCode,
+    ) -> *mut UText;
+    pub type utext_close = unsafe extern "C" fn(ut: *mut UText) -> *mut UText;
+
+    #[repr(C)]
+    pub struct UParseError {
+        pub line: i32,
+        pub offset: i32,
+        pub pre_context: [u16; 16],
+        pub post_context: [u16; 16],
+    }
+
+    #[repr(C)]
+    pub struct URegularExpression;
+
+    pub const UREGEX_UNIX_LINES: i32 = 1;
+    pub const UREGEX_CASE_INSENSITIVE: i32 = 2;
+    pub const UREGEX_COMMENTS: i32 = 4;
+    pub const UREGEX_MULTILINE: i32 = 8;
+    pub const UREGEX_LITERAL: i32 = 16;
+    pub const UREGEX_DOTALL: i32 = 32;
+    pub const UREGEX_UWORD: i32 = 256;
+    pub const UREGEX_ERROR_ON_UNKNOWN_ESCAPES: i32 = 512;
+
+    pub type uregex_open = unsafe extern "C" fn(
+        pattern: *const u16,
+        pattern_length: i32,
+        flags: i32,
+        pe: Option<&mut UParseError>,
+        status: &mut UErrorCode,
+    ) -> *mut URegularExpression;
+    pub type uregex_close = unsafe extern "C" fn(regexp: *mut URegularExpression);
+    pub type uregex_setTimeLimit =
+        unsafe extern "C" fn(regexp: *mut URegularExpression, limit: i32, status: &mut UErrorCode);
+    pub type uregex_setStackLimit =
+        unsafe extern "C" fn(regexp: *mut URegularExpression, limit: i32, status: &mut UErrorCode);
+    pub type uregex_setUText = unsafe extern "C" fn(
+        regexp: *mut URegularExpression,
+        text: *mut UText,
+        status: &mut UErrorCode,
+    );
+    pub type uregex_reset64 =
+        unsafe extern "C" fn(regexp: *mut URegularExpression, index: i64, status: &mut UErrorCode);
+    pub type uregex_findNext =
+        unsafe extern "C" fn(regexp: *mut URegularExpression, status: &mut UErrorCode) -> bool;
+    pub type uregex_start64 = unsafe extern "C" fn(
+        regexp: *mut URegularExpression,
+        group_num: i32,
+        status: &mut UErrorCode,
+    ) -> i64;
+    pub type uregex_end64 = unsafe extern "C" fn(
+        regexp: *mut URegularExpression,
+        group_num: i32,
+        status: &mut UErrorCode,
+    ) -> i64;
+}
