@@ -367,6 +367,7 @@ extern "C" fn utext_access(ut: &mut icu_ffi::UText, native_index: i64, forward: 
         // If we've only seen ASCII so far we can fast-pass the UTF-16 translation,
         // because we can just widen from u8 -> u16.
         if utf16_len == ascii_len {
+            // TODO: This crashes, why?
             let haystack = &chunk[..utf8_len_limit - ascii_len];
             // When it comes to performance, and the search space is small (which it is here),
             // it's always a good idea to keep the loops small and tight...
