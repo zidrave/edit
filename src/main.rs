@@ -30,7 +30,7 @@
 )]
 
 use buffer::RcTextBuffer;
-use helpers::{COORD_TYPE_SAFE_MAX, DisplayablePathBuf, Point};
+use helpers::{COORD_TYPE_SAFE_MAX, DisplayablePathBuf};
 use input::{kbmod, vk};
 
 use crate::framebuffer::IndexedColor;
@@ -39,7 +39,6 @@ use crate::loc::{LocId, loc};
 use crate::tui::*;
 use crate::vt::Token;
 use std::fs::File;
-use std::mem;
 use std::path::{Path, PathBuf};
 use std::{cmp, process};
 
@@ -97,6 +96,7 @@ enum StateEncodingChange {
 
 struct State {
     path: Option<PathBuf>,
+    filename: String,
     buffer: RcTextBuffer,
 
     // A ring buffer of the last 10 errors.
@@ -105,9 +105,9 @@ struct State {
     error_log_count: usize,
 
     wants_save: StateSave,
-    save_dir: DisplayablePathBuf,
+    save_pending_dir: DisplayablePathBuf,
+    save_pending_name: String, // This could be PathBuf, if `tui` would expose its TextBuffer for editline.
     save_entries: Option<Vec<DisplayablePathBuf>>,
-    save_filename: String, // This could be PathBuf, if `tui` would expose its TextBuffer for editline.
 
     wants_search: StateSearch,
     search_needle: String,
@@ -125,7 +125,7 @@ impl State {
             .nth(1)
             .and_then(|p| if p == "-" { None } else { Some(p) })
             .map(PathBuf::from);
-        let save_filename = path
+        let filename = path
             .as_ref()
             .and_then(|p| p.file_name())
             .unwrap_or_default()
@@ -134,7 +134,7 @@ impl State {
 
         let mut buffer = RcTextBuffer::new(false)?;
         buffer.set_margin_enabled(true);
-        buffer.set_ruler(if save_filename == "COMMIT_EDITMSG" {
+        buffer.set_ruler(if filename == "COMMIT_EDITMSG" {
             Some(72)
         } else {
             None
@@ -142,6 +142,7 @@ impl State {
 
         Ok(Self {
             path,
+            filename: filename.clone(),
             buffer,
 
             error_log: [const { String::new() }; 10],
@@ -149,9 +150,9 @@ impl State {
             error_log_count: 0,
 
             wants_save: StateSave::None,
-            save_dir: DisplayablePathBuf::new(std::env::current_dir()?),
+            save_pending_dir: DisplayablePathBuf::new(std::env::current_dir()?),
+            save_pending_name: filename,
             save_entries: None,
-            save_filename,
 
             wants_search: StateSearch::Hidden,
             search_needle: String::new(),
@@ -721,7 +722,11 @@ fn draw_dialog_saveas(ctx: &mut Context, state: &mut State) {
                 Overflow::Clip,
                 loc(LocId::SaveAsDialogPathLabel),
             );
-            ctx.label("dir", Overflow::TruncateMiddle, state.save_dir.as_str());
+            ctx.label(
+                "dir",
+                Overflow::TruncateMiddle,
+                state.save_pending_dir.as_str(),
+            );
 
             ctx.table_next_row();
             ctx.label(
@@ -729,7 +734,7 @@ fn draw_dialog_saveas(ctx: &mut Context, state: &mut State) {
                 Overflow::Clip,
                 &loc(LocId::SaveAsDialogNameLabel),
             );
-            ctx.editline("name", &mut state.save_filename);
+            ctx.editline("name", &mut state.save_pending_name);
             ctx.focus_on_first_present();
             ctx.inherit_focus();
             if ctx.is_focused() && ctx.consume_shortcut(vk::RETURN) {
@@ -739,11 +744,10 @@ fn draw_dialog_saveas(ctx: &mut Context, state: &mut State) {
         ctx.table_end();
 
         if state.save_entries.is_none() {
-            draw_refresh_save_entries(state);
+            draw_dialog_saveas_refresh_files(state);
         }
 
         let files = state.save_entries.as_ref().unwrap();
-        let mut change_dir = None;
 
         ctx.scrollarea_begin(
             "directory",
@@ -756,23 +760,19 @@ fn draw_dialog_saveas(ctx: &mut Context, state: &mut State) {
             },
         );
         ctx.attr_background_rgba(ctx.indexed(IndexedColor::Cyan));
-        ctx.next_block_id_mixin(state.save_dir.as_str().len() as u64);
+        ctx.next_block_id_mixin(state.save_pending_dir.as_str().len() as u64);
         ctx.list_begin("files");
         for entry in files.iter() {
-            if ctx.list_item(
-                state.save_filename == entry.as_str(),
+            match ctx.list_item(
+                state.save_pending_name == entry.as_str(),
                 Overflow::TruncateMiddle,
                 entry.as_str(),
             ) {
-                let str = entry.as_str();
-                if str.ends_with('/') || str == ".." {
-                    change_dir = Some(entry);
-                } else if state.save_filename != str {
-                    state.save_filename = str.to_string();
-                } else {
-                    // Treat clicking twice on an item as confirmation to save it.
-                    // TODO: This feels a bit weird if the user clicks on a `save_filename`-named item,
-                    // because it skips the double-click confirmation.
+                ListSelection::Unchanged => {}
+                ListSelection::Selected => {
+                    state.save_pending_name = entry.as_str().to_string();
+                }
+                ListSelection::Activated => {
                     state.wants_save = StateSave::Save;
                 }
             }
@@ -780,28 +780,16 @@ fn draw_dialog_saveas(ctx: &mut Context, state: &mut State) {
         ctx.list_end();
         ctx.scrollarea_end();
 
-        if let Some(entry) = change_dir {
-            let mut path = mem::take(&mut state.save_dir).take();
-
-            if entry.as_str() == ".." {
-                path.pop();
+        if state.wants_save == StateSave::Save {
+            if let Some(path) = draw_dialog_saveas_update_path(state) {
+                // Only update the path if the save was successful.
+                if draw_handle_save(state, Some(&path)) {
+                    state.path = Some(path);
+                    state.filename = state.save_pending_name.clone();
+                    state.wants_save = StateSave::None;
+                }
             } else {
-                // `entry` is a directory name with trailing "/",
-                // but we don't want the "/" in the path (it would look ugly).
-                let entry_str = entry.as_str();
-                path.push(&entry_str[..entry_str.len() - 1]);
-            }
-
-            state.save_dir = DisplayablePathBuf::new(path);
-            state.save_entries = None;
-            ctx.scrollarea_scroll_to(Point { x: 0, y: 0 });
-        }
-
-        if state.wants_save == StateSave::Save && !state.save_filename.is_empty() {
-            let path = Some(state.save_dir.as_path().join(&state.save_filename));
-            // Only update the path if the save was successful.
-            if draw_handle_save(state, path.as_ref()) {
-                state.path = path;
+                state.wants_save = StateSave::SaveAs;
             }
         }
     }
@@ -810,8 +798,44 @@ fn draw_dialog_saveas(ctx: &mut Context, state: &mut State) {
     }
 }
 
-fn draw_refresh_save_entries(state: &mut State) {
-    let dir = state.save_dir.as_path();
+// Returns Some(path) if the caller should attempt to save the file.
+fn draw_dialog_saveas_update_path(state: &mut State) -> Option<PathBuf> {
+    let path = state.save_pending_dir.as_path();
+    let path = path.join(&state.save_pending_name);
+    let path = match path.canonicalize() {
+        Ok(path) => path,
+        Err(err) => {
+            error_log_add(state, err.into());
+            return None;
+        }
+    };
+
+    let (dir, name) = if path.is_dir() {
+        (path.as_path(), String::new())
+    } else {
+        let dir = path.parent().unwrap_or(&path);
+        let name = path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        (dir, name)
+    };
+    if dir != state.save_pending_dir.as_path() {
+        state.save_pending_dir = DisplayablePathBuf::new(dir.to_path_buf());
+        state.save_entries = None;
+    }
+
+    state.save_pending_name = name;
+    if state.save_pending_name.is_empty() {
+        None
+    } else {
+        Some(path)
+    }
+}
+
+fn draw_dialog_saveas_refresh_files(state: &mut State) {
+    let dir = state.save_pending_dir.as_path();
     let mut files = Vec::new();
 
     if dir.parent().is_some() {
