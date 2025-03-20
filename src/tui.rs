@@ -2258,14 +2258,18 @@ impl Context<'_, '_> {
             return;
         }
 
-        let mut off = 0;
-        while off < text.len() {
-            let mut c = text.as_bytes()[off];
-            c &= !0x20; // transform `c` to uppercase
-            if c == accelerator as u8 {
+        let mut off = text.len();
+
+        for (i, c) in text.bytes().enumerate() {
+            // Perfect match (uppercase character) --> stop
+            if c as char == accelerator {
+                off = i;
                 break;
             }
-            off += 1;
+            // Inexact match (lowercase character) --> use first hit
+            if (c & !0x20) as char == accelerator && off == text.len() {
+                off = i;
+            }
         }
 
         self.styled_label_begin("label", Overflow::Clip);

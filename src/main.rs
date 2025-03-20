@@ -112,7 +112,9 @@ struct State {
     search_needle: String,
     search_options: buffer::SearchOptions,
 
+    wants_encoding_focus: bool,
     wants_encoding_change: StateEncodingChange,
+    wants_indentation_focus: bool,
     wants_about: bool,
     wants_exit: bool,
     exit: bool,
@@ -157,7 +159,9 @@ impl State {
             search_needle: String::new(),
             search_options: buffer::SearchOptions::default(),
 
+            wants_encoding_focus: false,
             wants_encoding_change: StateEncodingChange::None,
+            wants_indentation_focus: false,
             wants_about: false,
             wants_exit: false,
             exit: false,
@@ -406,6 +410,16 @@ fn draw_menu_edit(ctx: &mut Context, state: &mut State) {
     {
         state.wants_search = StateSearch::Visible { focus: true };
     }
+    if ctx.menubar_menu_item(loc(LocId::EditChangeNewlineSequence), 'N', vk::NULL) {
+        let crlf = state.buffer.is_crlf();
+        state.buffer.normalize_newlines(!crlf);
+    }
+    if ctx.menubar_menu_item(loc(LocId::EditChangeEncoding), 'E', vk::NULL) {
+        state.wants_encoding_focus = true;
+    }
+    if ctx.menubar_menu_item(loc(LocId::EditChangeIndentation), 'I', vk::NULL) {
+        state.wants_indentation_focus = true;
+    }
     ctx.menubar_menu_end();
 }
 
@@ -547,9 +561,13 @@ fn draw_statusbar(ctx: &mut Context, state: &mut State) {
         }
 
         ctx.button("encoding", Overflow::Clip, state.buffer.encoding());
+        if state.wants_encoding_focus {
+            state.wants_encoding_focus = false;
+            ctx.steal_focus();
+        }
         if ctx.contains_focus() {
             if state.path.is_some() {
-                ctx.block_begin("encoding-picker");
+                ctx.block_begin("frame");
                 ctx.attr_float(FloatSpec {
                     anchor: Anchor::Last,
                     gravity_x: 0.0,
@@ -558,17 +576,24 @@ fn draw_statusbar(ctx: &mut Context, state: &mut State) {
                     offset_y: 0,
                 });
                 ctx.attr_background_rgba(ctx.indexed(IndexedColor::White));
-                ctx.attr_border();
                 ctx.attr_padding(Rect::two(0, 1));
+                ctx.attr_border();
                 {
-                    if ctx.button("reopen", Overflow::Clip, loc(LocId::EncodingReopen)) {
-                        state.wants_encoding_change = StateEncodingChange::Reopen;
-                    }
+                    ctx.list_begin("options");
                     ctx.focus_on_first_present();
-
-                    if ctx.button("convert", Overflow::Clip, loc(LocId::EncodingConvert)) {
-                        state.wants_encoding_change = StateEncodingChange::Convert;
+                    {
+                        if ctx.list_item(false, Overflow::Clip, loc(LocId::EncodingReopen))
+                            == ListSelection::Activated
+                        {
+                            state.wants_encoding_change = StateEncodingChange::Reopen;
+                        }
+                        if ctx.list_item(false, Overflow::Clip, loc(LocId::EncodingConvert))
+                            == ListSelection::Activated
+                        {
+                            state.wants_encoding_change = StateEncodingChange::Convert;
+                        }
                     }
+                    ctx.list_end();
                 }
                 ctx.block_end();
             } else {
@@ -590,6 +615,10 @@ fn draw_statusbar(ctx: &mut Context, state: &mut State) {
                 state.buffer.tab_size(),
             ),
         );
+        if state.wants_indentation_focus {
+            state.wants_indentation_focus = false;
+            ctx.steal_focus();
+        }
         if ctx.contains_focus() {
             ctx.table_begin("indentation-picker");
             ctx.attr_float(FloatSpec {
@@ -611,7 +640,7 @@ fn draw_statusbar(ctx: &mut Context, state: &mut State) {
 
                 ctx.list_begin("type");
                 ctx.focus_on_first_present();
-                ctx.attr_padding(Rect::two(0, 2));
+                ctx.attr_padding(Rect::two(0, 1));
                 {
                     if ctx.list_item(
                         state.buffer.indent_with_tabs(),

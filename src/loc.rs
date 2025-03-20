@@ -21,6 +21,9 @@ pub enum LocId {
     EditPaste,
     EditFind,
     EditReplace,
+    EditChangeNewlineSequence,
+    EditChangeEncoding,
+    EditChangeIndentation,
 
     // View menu
     View,
@@ -296,6 +299,49 @@ const S_LANG_LUT: [[&str; LangId::Count as usize]; LocId::Count as usize] = [
         /* ru      */ "Заменить",
         /* zh_hans */ "替换",
         /* zh_hant */ "取代",
+    ],
+    // EditChangeNewlineSequence
+    [
+        /* en      */ "Change Newline Sequence",
+        /* de      */ "Zeilenende ändern",
+        /* es      */ "Cambiar nueva línea",
+        /* fr      */ "Changer fin de ligne",
+        /* it      */ "Cambia fine riga",
+        /* ja      */ "改行コード変更",
+        /* ko      */ "줄 바꿈 변경",
+        /* pt_br   */ "Alterar quebra de linha",
+        /* ru      */ "Изменить разделитель строк",
+        /* zh_hans */ "更改换行符",
+        /* zh_hant */ "更改換行符",
+    ],
+
+    // EditChangeEncoding
+    [
+        /* en      */ "Change Encoding",
+        /* de      */ "Kodierung ändern",
+        /* es      */ "Cambiar codificación",
+        /* fr      */ "Changer encodage",
+        /* it      */ "Cambia codifica",
+        /* ja      */ "エンコーディング変更",
+        /* ko      */ "인코딩 변경",
+        /* pt_br   */ "Alterar codificação",
+        /* ru      */ "Изменить кодировку",
+        /* zh_hans */ "更改编码",
+        /* zh_hant */ "更改編碼",
+    ],
+    // EditChangeIndentation
+    [
+        /* en      */ "Change Indentation",
+        /* de      */ "Einrückung ändern",
+        /* es      */ "Cambiar sangría",
+        /* fr      */ "Changer l'indentation",
+        /* it      */ "Cambia indentazione",
+        /* ja      */ "インデントを変更",
+        /* ko      */ "들여쓰기 변경",
+        /* pt_br   */ "Alterar indentação",
+        /* ru      */ "Изменить отступ",
+        /* zh_hans */ "更改缩进",
+        /* zh_hant */ "更改縮排",
     ],
 
     // View
