@@ -1,4 +1,4 @@
-use crate::sys;
+use crate::{icu, sys};
 use std::num::NonZeroU32;
 use std::{fmt, io, result};
 
@@ -55,7 +55,7 @@ impl Error {
             _ => {
                 debug_assert!(!self.is_app());
                 if self.is_icu() {
-                    format!("ICU Error {:#08x}", self.code())
+                    icu::format_error(self)
                 } else {
                     sys::format_error(self)
                 }

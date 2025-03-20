@@ -39,6 +39,30 @@ pub fn get_available_encodings() -> &'static [DisplayableCString] {
     }
 }
 
+pub fn format_error(err: apperr::Error) -> String {
+    fn format(err: apperr::Error) -> &'static str {
+        let Ok(f) = init_if_needed() else {
+            return "";
+        };
+
+        let status = icu_ffi::UErrorCode::new(err.code());
+        let ptr = unsafe { (f.u_errorName)(status) };
+        if ptr.is_null() {
+            return "";
+        }
+
+        let str = unsafe { CStr::from_ptr(ptr) };
+        str.to_str().unwrap_or("")
+    }
+
+    let msg = format(err);
+    if !msg.is_empty() {
+        format!("ICU Error: {}", msg)
+    } else {
+        format!("ICU Error: {:#08x}", err.code())
+    }
+}
+
 pub struct Converter<'pivot> {
     source: *mut icu_ffi::UConverter,
     target: *mut icu_ffi::UConverter,
@@ -658,6 +682,8 @@ pub fn fold_case(input: &str) -> String {
 
 #[allow(non_snake_case)]
 struct LibraryFunctions {
+    u_errorName: icu_ffi::u_errorName,
+
     ucnv_getAvailableName: icu_ffi::ucnv_getAvailableName,
     ucnv_open: icu_ffi::ucnv_open,
     ucnv_close: icu_ffi::ucnv_close,
@@ -684,7 +710,9 @@ struct LibraryFunctions {
 }
 
 // SAFETY:
-const LIBRARY_FUNCTIONS_NAMES: [&CStr; 19] = [
+const LIBRARY_FUNCTIONS_NAMES: [&CStr; 20] = [
+    c"u_errorName",
+    //
     c"ucnv_getAvailableName",
     c"ucnv_open",
     c"ucnv_close",
@@ -784,13 +812,17 @@ mod icu_ffi {
     #![allow(non_camel_case_types)]
 
     use crate::apperr;
-    use std::ffi::c_char;
+    use std::ffi::{c_char, c_int, c_void};
 
     #[derive(Copy, Clone, Eq, PartialEq)]
     #[repr(transparent)]
-    pub struct UErrorCode(std::os::raw::c_int);
+    pub struct UErrorCode(c_int);
 
     impl UErrorCode {
+        pub const fn new(code: u32) -> Self {
+            Self(code as c_int)
+        }
+
         pub fn is_success(&self) -> bool {
             self.0 <= 0
         }
@@ -808,6 +840,8 @@ mod icu_ffi {
     pub const U_ZERO_ERROR: UErrorCode = UErrorCode(0);
     pub const U_BUFFER_OVERFLOW_ERROR: UErrorCode = UErrorCode(15);
     pub const U_UNSUPPORTED_ERROR: UErrorCode = UErrorCode(16);
+
+    pub type u_errorName = unsafe extern "C" fn(code: UErrorCode) -> *const c_char;
 
     pub struct UConverter;
 
@@ -946,12 +980,12 @@ mod icu_ffi {
         pub chunk_length: i32,
         pub chunk_contents: *const u16,
         pub p_funcs: &'static UTextFuncs,
-        pub p_extra: *mut std::ffi::c_void,
-        pub context: *mut std::ffi::c_void,
-        pub p: *mut std::ffi::c_void,
-        pub q: *mut std::ffi::c_void,
-        pub r: *mut std::ffi::c_void,
-        pub priv_p: *mut std::ffi::c_void,
+        pub p_extra: *mut c_void,
+        pub context: *mut c_void,
+        pub p: *mut c_void,
+        pub q: *mut c_void,
+        pub r: *mut c_void,
+        pub priv_p: *mut c_void,
         pub a: i64,
         pub b: i32,
         pub c: i32,
