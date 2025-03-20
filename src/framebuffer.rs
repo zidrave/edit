@@ -162,13 +162,22 @@ impl Framebuffer {
         let line_bytes = line.as_bytes();
         let mut cfg_old = ucd::MeasurementConfig::new(&line_bytes);
         let res_old_beg = cfg_old.goto_visual(Point { x: left, y: 0 });
-        let res_old_end = cfg_old.goto_visual(Point { x: right, y: 0 });
+        let mut res_old_end = cfg_old.goto_visual(Point { x: right, y: 0 });
+
+        // Since the goto functions will always stop short of the target position,
+        // we need to manually step beyond it if we intersect with a wide glyph.
+        if res_old_end.visual_pos.x < right {
+            res_old_end = cfg_old.goto_logical(Point {
+                x: res_old_end.logical_pos.x + 1,
+                y: 0,
+            });
+        }
 
         // If we intersect a wide glyph, we need to pad the new text with spaces.
         let mut str_new = &text[..res_new.offset];
         let mut str_buf = String::new();
-        let overlap_beg = res_old_beg.visual_pos.x - left;
-        let overlap_end = right - res_old_end.visual_pos.x;
+        let overlap_beg = left - res_old_beg.visual_pos.x;
+        let overlap_end = res_old_end.visual_pos.x - right;
         if overlap_beg > 0 || overlap_end > 0 {
             if overlap_beg > 0 {
                 helpers::string_append_repeat(&mut str_buf, ' ', overlap_beg as usize);
