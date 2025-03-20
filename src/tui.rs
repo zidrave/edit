@@ -484,17 +484,17 @@ impl Tui {
 
         if node.attributes.focus_brackets {
             let has_focus = self.is_node_focused(node.id);
-            let center_y = (outer_clipped.top + outer_clipped.bottom) / 2;
+            let center_y = (node.inner_clipped.top + node.inner_clipped.bottom) / 2;
             self.framebuffer.replace_text(
                 center_y,
-                node.outer.left,
-                node.outer.left + 1,
+                node.inner.left - 1,
+                node.inner.left,
                 if has_focus { ">" } else { "[" },
             );
             self.framebuffer.replace_text(
                 center_y,
-                node.outer.right - 1,
-                node.outer.right,
+                node.inner.right,
+                node.inner.right + 1,
                 if has_focus { "<" } else { "]" },
             );
         }
@@ -1116,9 +1116,9 @@ impl Context<'_, '_> {
         last_node.attributes.bordered = true;
     }
 
-    pub fn attr_alignment(&mut self, align: Alignment) {
+    pub fn attr_position(&mut self, align: Position) {
         let last_node = self.tree.last_node_mut();
-        last_node.attributes.align = align;
+        last_node.attributes.position = align;
     }
 
     pub fn attr_padding(&mut self, padding: Rect) {
@@ -1893,7 +1893,7 @@ impl Context<'_, '_> {
         self.block_begin(classname);
 
         let container = self.tree.last_node_mut();
-        container.content = NodeContent::Scrollarea(Point::MIN);
+        container.content = NodeContent::Scrollarea(Default::default());
 
         if intrinsic_size.width > 0 || intrinsic_size.height > 0 {
             container.intrinsic_size.width = intrinsic_size.width.max(0);
@@ -2510,8 +2510,9 @@ struct FloatAttributes {
 }
 
 #[derive(Default)]
-pub enum Alignment {
+pub enum Position {
     #[default]
+    Stretch,
     Left,
     Center,
     Right,
@@ -2520,7 +2521,7 @@ pub enum Alignment {
 #[derive(Default)]
 struct Attributes {
     float: Option<FloatAttributes>,
-    align: Alignment,
+    position: Position,
     padding: Rect,
     bg: u32,
     fg: u32,
@@ -2929,21 +2930,27 @@ impl Node {
                 let mut y = self.inner.top;
 
                 for child in Tree::iterate_siblings(self.children.first) {
-                    let mut size = child.intrinsic_to_outer();
-                    let remaining = width - size.width;
-                    size.width = width;
-                    child.outer.left = match child.attributes.align {
-                        Alignment::Left => x,
-                        Alignment::Center => x + remaining / 2,
-                        Alignment::Right => x + remaining,
+                    let size = child.intrinsic_to_outer();
+                    let remaining = (width - size.width).max(0);
+
+                    child.outer.left = x + match child.attributes.position {
+                        Position::Stretch | Position::Left => 0,
+                        Position::Center => remaining / 2,
+                        Position::Right => remaining,
                     };
+                    child.outer.right = child.outer.left
+                        + match child.attributes.position {
+                            Position::Stretch => width,
+                            _ => size.width,
+                        };
                     child.outer.top = y;
-                    child.outer.right = x + size.width;
                     child.outer.bottom = y + size.height;
+
                     child.outer = child.outer.intersect(self.inner);
                     child.inner = child.outer_to_inner(child.outer);
                     child.outer_clipped = child.outer.intersect(clip);
                     child.inner_clipped = child.inner.intersect(clip);
+
                     y += size.height;
                 }
 

@@ -684,7 +684,7 @@ fn draw_statusbar(ctx: &mut Context, state: &mut State) {
         });
         {
             ctx.label("exit", Overflow::TruncateMiddle, &state.save_filename);
-            ctx.attr_alignment(Alignment::Right);
+            ctx.attr_position(Position::Right);
         }
         ctx.block_end();
     }
@@ -931,7 +931,7 @@ fn draw_handle_wants_exit(ctx: &mut Context, state: &mut State) {
 
         ctx.table_begin("choices");
         ctx.attr_padding(Rect::three(0, 2, 1));
-        ctx.attr_alignment(Alignment::Center);
+        ctx.attr_position(Position::Center);
         ctx.table_set_cell_gap(Size {
             width: 2,
             height: 0,
@@ -973,7 +973,7 @@ fn draw_dialog_about(ctx: &mut Context, state: &mut State) {
                 Overflow::TruncateTail,
                 loc(LocId::AboutDialogDescription),
             );
-            ctx.attr_alignment(Alignment::Center);
+            ctx.attr_position(Position::Center);
             ctx.label(
                 "version",
                 Overflow::TruncateHead,
@@ -983,13 +983,13 @@ fn draw_dialog_about(ctx: &mut Context, state: &mut State) {
                     env!("CARGO_PKG_VERSION")
                 ),
             );
-            ctx.attr_alignment(Alignment::Center);
+            ctx.attr_position(Position::Center);
             ctx.label(
                 "copyright",
                 Overflow::TruncateTail,
                 "Copyright (c) Microsoft Corp 2025",
             );
-            ctx.attr_alignment(Alignment::Center);
+            ctx.attr_position(Position::Center);
         }
         ctx.block_end();
     }
@@ -1017,6 +1017,7 @@ fn draw_error_log(ctx: &mut Context, state: &mut State) {
             state.error_log_count = 0;
         }
         ctx.attr_padding(Rect::three(1, 2, 1));
+        ctx.attr_position(Position::Center);
         ctx.focus_on_first_present();
     }
     if ctx.modal_end() {
