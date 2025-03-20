@@ -494,13 +494,15 @@ fn draw_search(ctx: &mut Context, state: &mut State) {
     }
     ctx.block_end();
 
-    if search_next {
+    if search_next && !state.search_needle.is_empty() {
         if let Err(err) = state
             .buffer
             .find_and_select(&state.search_needle, state.search_options)
         {
+            if err == apperr::APP_ICU_MISSING {
+                state.wants_search = StateSearch::Disabled;
+            }
             error_log_add(state, err);
-            state.wants_search = StateSearch::Disabled;
         }
     }
 }
