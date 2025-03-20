@@ -1505,7 +1505,7 @@ impl Context<'_, '_> {
             content.scroll_offset.x += self.input_scroll_delta.x;
             content.scroll_offset.y += self.input_scroll_delta.y;
             self.set_input_consumed();
-            return true;
+            return false;
         }
 
         if self.tui.mouse_state != InputMouseState::None && self.tui.is_node_focused(node_prev.id) {
