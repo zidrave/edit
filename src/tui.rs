@@ -1700,12 +1700,12 @@ impl Context<'_, '_> {
                     }
                 }
                 vk::LEFT => {
-                    let granularity = if modifiers == kbmod::CTRL {
+                    let granularity = if modifiers.contains(kbmod::CTRL) {
                         CursorMovement::Word
                     } else {
                         CursorMovement::Grapheme
                     };
-                    if modifiers == kbmod::SHIFT {
+                    if modifiers.contains(kbmod::SHIFT) {
                         tb.selection_update_delta(granularity, -1);
                     } else {
                         tb.cursor_move_delta(granularity, -1);
@@ -1748,12 +1748,12 @@ impl Context<'_, '_> {
                     }
                 }
                 vk::RIGHT => {
-                    let granularity = if modifiers == kbmod::CTRL {
+                    let granularity = if modifiers.contains(kbmod::CTRL) {
                         CursorMovement::Word
                     } else {
                         CursorMovement::Grapheme
                     };
-                    if modifiers == kbmod::SHIFT {
+                    if modifiers.contains(kbmod::SHIFT) {
                         tb.selection_update_delta(granularity, 1);
                     } else {
                         tb.cursor_move_delta(granularity, 1);
