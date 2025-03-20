@@ -62,6 +62,7 @@ pub struct Tui {
     cached_text_buffers: Vec<CachedTextBuffer>,
     hovered_node_path: Vec<u64>,
     focused_node_path: Vec<u64>,
+    focused_node_path_previous_frame: Vec<u64>,
     focused_node_path_for_scrolling: Vec<u64>,
 
     prev_tree: Tree,
@@ -92,6 +93,7 @@ impl Tui {
             cached_text_buffers: Vec::with_capacity(16),
             hovered_node_path: Vec::with_capacity(16),
             focused_node_path: Vec::with_capacity(16),
+            focused_node_path_previous_frame: Vec::with_capacity(16),
             focused_node_path_for_scrolling: Vec::with_capacity(16),
 
             prev_tree: Tree::new(),
@@ -104,6 +106,8 @@ impl Tui {
         };
         tui.hovered_node_path.push(ROOT_ID);
         tui.focused_node_path.push(ROOT_ID);
+        tui.focused_node_path_previous_frame.push(ROOT_ID);
+        tui.focused_node_path_for_scrolling.push(ROOT_ID);
         tui
     }
 
@@ -127,6 +131,11 @@ impl Tui {
             self.mouse_state = InputMouseState::None;
             self.mouse_down_position = Point::MIN;
         }
+
+        helpers::vec_replace_all_reuse(
+            &mut self.focused_node_path_previous_frame,
+            &self.focused_node_path,
+        );
 
         if self.scroll_to_focused() {
             self.needs_settling();
@@ -269,16 +278,6 @@ impl Tui {
         }
     }
 
-    fn build_node_path(node: Option<&Node>, path: &mut Vec<u64>) {
-        path.clear();
-        iter::successors(node, |&node| Tree::node_ref(node.parent)).for_each(|node| {
-            path.push(node.id);
-        });
-        if path.is_empty() {
-            path.push(ROOT_ID);
-        }
-    }
-
     fn report_context_completion(&mut self, ctx: &mut Context) {
         // If this hits, you forgot to block_end() somewhere. The best way to figure
         // out where is to do a binary search of commenting out code in main.rs.
@@ -383,6 +382,16 @@ impl Tui {
             root.outer_clipped = root.outer;
             root.inner_clipped = root.inner;
             root.layout_children(root.outer);
+        }
+    }
+
+    fn build_node_path(node: Option<&Node>, path: &mut Vec<u64>) {
+        path.clear();
+        iter::successors(node, |&node| Tree::node_ref(node.parent)).for_each(|node| {
+            path.push(node.id);
+        });
+        if path.is_empty() {
+            path.push(ROOT_ID);
         }
     }
 
@@ -1213,7 +1222,16 @@ impl Context<'_, '_> {
 
     pub fn modal_end(&mut self) -> bool {
         self.block_end();
-        !self.contains_focus() || self.consume_shortcut(vk::ESCAPE)
+
+        if !self.contains_focus() {
+            helpers::vec_replace_all_reuse(
+                &mut self.tui.focused_node_path,
+                &self.tui.focused_node_path_previous_frame,
+            );
+            self.needs_settling = true;
+        }
+
+        self.consume_shortcut(vk::ESCAPE)
     }
 
     pub fn table_begin(&mut self, classname: &'static str) {

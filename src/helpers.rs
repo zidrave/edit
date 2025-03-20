@@ -376,6 +376,11 @@ pub fn vec_insert_at<T: Copy>(dst: &mut Vec<T>, off: usize, src: &[T]) {
     }
 }
 
+pub fn vec_replace_all_reuse<T: Clone>(dst: &mut Vec<T>, src: &[T]) {
+    dst.clear();
+    dst.extend_from_slice(src);
+}
+
 // Works just like `std::hint::cold_path`, but it's stable.
 #[cold]
 #[inline(always)]
