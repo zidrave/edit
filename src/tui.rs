@@ -1485,81 +1485,66 @@ impl Context<'_, '_> {
 
         let tb = &mut *content.buffer;
 
-        if self.tui.mouse_state != InputMouseState::None {
+        if self.tui.mouse_state == InputMouseState::Scroll && self.tui.is_node_hovered(node_prev.id)
+        {
+            content.scroll_offset.x += self.input_scroll_delta.x;
+            content.scroll_offset.y += self.input_scroll_delta.y;
+            self.set_input_consumed();
+            return true;
+        }
+
+        if self.tui.mouse_state != InputMouseState::None && self.tui.is_node_focused(node_prev.id) {
             let mut make_cursor_visible = false;
+            let pos = Point {
+                x: self.tui.mouse_position.x - node_prev.inner.left - tb.get_margin_width()
+                    + content.scroll_offset.x,
+                y: self.tui.mouse_position.y - node_prev.inner.top + content.scroll_offset.y,
+            };
 
-            match self.tui.mouse_state {
-                InputMouseState::Left => {
-                    if self.tui.is_node_hovered(node_prev.id) {
-                        let pos = Point {
-                            x: self.tui.mouse_position.x
-                                - node_prev.inner.left
-                                - tb.get_margin_width()
-                                + content.scroll_offset.x,
-                            y: self.tui.mouse_position.y - node_prev.inner.top
-                                + content.scroll_offset.y,
-                        };
-
-                        match self.input_mouse_gesture {
-                            InputMouseGesture::Drag(delta) => {
-                                let track_rect = Rect {
-                                    left: node_prev.inner.right - 1,
-                                    top: node_prev.inner.top,
-                                    right: node_prev.inner.right,
-                                    bottom: node_prev.inner.bottom,
-                                };
-                                if track_rect.contains(self.tui.mouse_down_position) {
-                                    let track_height = track_rect.height();
-                                    if track_height > 0 {
-                                        // The textarea supports 1 height worth of "scrolling beyond the end".
-                                        // `track_height` is the same as the viewport height.
-                                        let content_height =
-                                            tb.get_visual_line_count() + track_height;
-                                        content.scroll_offset.y +=
-                                            delta.y * content_height / track_height;
-                                    }
-                                } else {
-                                    tb.selection_update_visual(pos);
-                                }
-                            }
-                            _ => {
-                                if pos == tb.get_cursor_visual_pos() {
-                                    if self.time - content.last_click
-                                        < std::time::Duration::from_millis(500)
-                                    {
-                                        tb.select_word();
-                                    }
-                                } else if self.input_mouse_modifiers.contains(kbmod::SHIFT) {
-                                    // TODO: Untested because Windows Terminal surprisingly doesn't support Shift+Click.
-                                    tb.selection_update_visual(pos);
-                                } else {
-                                    tb.cursor_move_to_visual(pos);
-                                }
-                                content.last_click = self.time;
-                                make_cursor_visible = true;
-                            }
+            match self.input_mouse_gesture {
+                InputMouseGesture::DoubleClick => {
+                    tb.select_word();
+                }
+                InputMouseGesture::Drag(delta) => {
+                    let track_rect = Rect {
+                        left: node_prev.inner.right - 1,
+                        top: node_prev.inner.top,
+                        right: node_prev.inner.right,
+                        bottom: node_prev.inner.bottom,
+                    };
+                    if track_rect.contains(self.tui.mouse_down_position) {
+                        let track_height = track_rect.height();
+                        if track_height > 0 {
+                            // The textarea supports 1 height worth of "scrolling beyond the end".
+                            // `track_height` is the same as the viewport height.
+                            let content_height = tb.get_visual_line_count() + track_height;
+                            content.scroll_offset.y += delta.y * content_height / track_height;
                         }
-
-                        content.preferred_column = tb.get_cursor_visual_pos().x;
-                        self.set_input_consumed();
+                    } else {
+                        tb.selection_update_visual(pos);
                     }
                 }
-                InputMouseState::Release => {
-                    if self.tui.is_node_hovered(node_prev.id) {
-                        tb.selection_finalize();
-                        self.set_input_consumed();
+                _ => {
+                    match self.tui.mouse_state {
+                        InputMouseState::Left => {
+                            content.preferred_column = tb.get_cursor_visual_pos().x;
+                            if self.input_mouse_modifiers.contains(kbmod::SHIFT) {
+                                // TODO: Untested because Windows Terminal surprisingly doesn't support Shift+Click.
+                                tb.selection_update_visual(pos);
+                            } else {
+                                tb.cursor_move_to_visual(pos);
+                            }
+                            make_cursor_visible = true;
+                        }
+                        InputMouseState::Release => {
+                            tb.selection_finalize();
+                        }
+                        _ => return false,
                     }
                 }
-                InputMouseState::Scroll => {
-                    if self.tui.is_node_hovered(node_prev.id) {
-                        content.scroll_offset.x += self.input_scroll_delta.x;
-                        content.scroll_offset.y += self.input_scroll_delta.y;
-                        self.set_input_consumed();
-                    }
-                }
-                _ => {}
             }
 
+            self.set_input_consumed();
             return make_cursor_visible;
         }
 
