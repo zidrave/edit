@@ -896,18 +896,29 @@ impl TextBuffer {
                 flags |= icu::Regex::LITERAL;
             }
 
+            // Move the start of the search to the start of the selection,
+            // or otherwise to the current cursor position.
+            let start_offset = match self.selection {
+                TextBufferSelection::Active { beg, .. } | TextBufferSelection::Done { beg, .. } => {
+                    self.cursor_move_to_logical_internal(self.cursor, beg)
+                        .offset
+                }
+                _ => self.cursor.offset,
+            };
+
             let text = unsafe { icu::Text::new(self)? };
             let regex = unsafe { icu::Regex::new(&pattern, flags, &text)? };
+
             let mut search = ActiveSearch {
                 pattern: pattern.to_string(),
                 options,
                 text,
                 regex,
-                at_start: self.cursor.offset == 0,
+                at_start: start_offset == 0,
                 no_matches: false,
             };
-            if self.cursor.offset != 0 {
-                search.regex.reset(self.cursor.offset);
+            if start_offset != 0 {
+                search.regex.reset(start_offset);
             }
             self.search = Some(search);
         }
@@ -942,6 +953,7 @@ impl TextBuffer {
         } else {
             // Avoid searching through the entire document again if we know there's nothing to find.
             search.no_matches = true;
+            self.selection = TextBufferSelection::None;
         }
 
         Ok(())

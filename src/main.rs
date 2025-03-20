@@ -78,6 +78,7 @@ enum StateSearch {
     Hidden,
     Focus,
     Shown,
+    Disabled,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -344,7 +345,7 @@ fn draw(ctx: &mut Context, state: &mut State) {
     if ctx.consume_shortcut(kbmod::CTRL | vk::Q) {
         state.wants_exit = true;
     }
-    if ctx.consume_shortcut(kbmod::CTRL | vk::F) {
+    if state.wants_search != StateSearch::Disabled && ctx.consume_shortcut(kbmod::CTRL | vk::F) {
         state.wants_search = StateSearch::Focus;
     }
 }
@@ -398,7 +399,9 @@ fn draw_menu_edit(ctx: &mut Context, state: &mut State) {
     if ctx.menubar_menu_item(loc(LocId::EditPaste), 'P', kbmod::CTRL | vk::V) {
         state.buffer.write(ctx.get_clipboard());
     }
-    if ctx.menubar_menu_item(loc(LocId::EditFind), 'F', kbmod::CTRL | vk::F) {
+    if state.wants_search != StateSearch::Disabled
+        && ctx.menubar_menu_item(loc(LocId::EditFind), 'F', kbmod::CTRL | vk::F)
+    {
         state.wants_search = StateSearch::Focus;
     }
     ctx.menubar_menu_end();
@@ -419,6 +422,8 @@ fn draw_menu_help(ctx: &mut Context, state: &mut State) {
 }
 
 fn draw_search(ctx: &mut Context, state: &mut State) {
+    let mut search_next;
+
     ctx.block_begin("search");
     ctx.attr_background_rgba(ctx.indexed(IndexedColor::White));
     {
@@ -445,14 +450,7 @@ fn draw_search(ctx: &mut Context, state: &mut State) {
                 state.wants_search = StateSearch::Shown;
                 ctx.steal_focus();
             }
-            if ctx.is_focused() && ctx.consume_shortcut(vk::RETURN) {
-                if let Err(err) = state
-                    .buffer
-                    .find_and_select(&state.search_needle, state.search_options)
-                {
-                    error_log_add(state, err);
-                }
-            }
+            search_next = ctx.is_focused() && ctx.consume_shortcut(vk::RETURN);
         }
         ctx.table_end();
 
@@ -468,28 +466,43 @@ fn draw_search(ctx: &mut Context, state: &mut State) {
                 state.wants_search = StateSearch::Hidden;
             }
 
-            ctx.checkbox(
+            let mut change = false;
+            change |= ctx.checkbox(
                 "match-case",
                 Overflow::Clip,
                 loc(LocId::SearchMatchCase),
                 &mut state.search_options.match_case,
             );
-            ctx.checkbox(
+            change |= ctx.checkbox(
                 "whole-word",
                 Overflow::Clip,
                 loc(LocId::SearchWholeWord),
                 &mut state.search_options.whole_word,
             );
-            ctx.checkbox(
+            change |= ctx.checkbox(
                 "use-regex",
                 Overflow::Clip,
                 loc(LocId::SearchUseRegex),
                 &mut state.search_options.use_regex,
             );
+            if change {
+                search_next = true;
+                state.wants_search = StateSearch::Focus;
+            }
         }
         ctx.table_end();
     }
     ctx.block_end();
+
+    if search_next {
+        if let Err(err) = state
+            .buffer
+            .find_and_select(&state.search_needle, state.search_options)
+        {
+            error_log_add(state, err);
+            state.wants_search = StateSearch::Disabled;
+        }
+    }
 }
 
 fn draw_editor(ctx: &mut Context, state: &mut State) {
