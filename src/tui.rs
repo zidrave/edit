@@ -405,11 +405,7 @@ impl Tui {
         // If the focus has changed, the new node may need to be re-rendered.
         // Same, every time we encounter a previously unknown node via `get_prev_node`,
         // because that means it likely failed to get crucial information such as the layout size.
-        //
-        // But we put a maximum on how many times we'll re-render in a row, in order
-        // to prevent accidental infinite loops. Honestly, anything >2 would be weird.
-        debug_assert!(self.settling_want < 5);
-        self.settling_want = (self.settling_have + 1).min(10);
+        self.settling_want = self.settling_have + 1;
     }
 
     /// Renders all nodes into a string-frame representation.
@@ -825,20 +821,20 @@ impl Tui {
         // Find the next focusable node upwards in the hierarchy.
         let focusable_idx = path
             .iter()
+            .skip(pop_minimum)
             .position(|&id| {
                 self.get_prev_node(id)
                     .is_some_and(|node| node.attributes.focusable)
             })
+            .map(|idx| idx + pop_minimum)
             .unwrap_or(path.len());
 
-        let keep_idx = focusable_idx + pop_minimum;
-
-        if keep_idx == 0 {
+        if focusable_idx == 0 {
             // Nothing to remove.
             false
         } else {
             // Remove all the nodes between us and the next focusable node.
-            self.focused_node_path.drain(..focusable_idx + pop_minimum);
+            self.focused_node_path.drain(..focusable_idx);
             if self.focused_node_path.is_empty() {
                 self.focused_node_path.push(ROOT_ID);
             }
