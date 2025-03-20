@@ -10,6 +10,7 @@ use std::mem;
 use std::ptr::{self, null};
 
 const ROOT_ID: u64 = 0x14057B7EF767814F; // Knuth's MMIX constant
+const SHIFT_TAB: InputKey = vk::TAB.with_modifiers(kbmod::SHIFT);
 
 type InputText<'input> = input::InputText<'input>;
 type InputKey = input::InputKey;
@@ -843,8 +844,6 @@ impl Tui {
     }
 
     fn move_focus(&mut self, input: InputKey) -> bool {
-        const SHIFT_TAB: InputKey = vk::TAB.with_modifiers(kbmod::SHIFT);
-
         let Some(focused) = self.get_prev_node(self.focused_node_path[0]) else {
             debug_assert!(false); // The caller should've cleaned up the focus path.
             return false;
@@ -882,48 +881,48 @@ impl Tui {
             _ => return false,
         };
 
-        // Figure out the container within which the focuse must be contained.
+        let mut focused_start = focused;
+        let mut focused_next = focused;
+        let mut root = focused;
+
+        // Figure out if we're inside a focus void (a container that doesn't
+        // allow tabbing inside), and in that case, toss the focus to it.
+        //
+        // Also, figure out the container within which the focuse must be contained.
         // This way, tab/shift-tab only moves within the same window.
         // The ROOT_ID node has no parent, and the others have a float attribute.
-        // If the window is the focused node, it should of course not move upward.
-        let mut root = focused;
-        while !root.parent.is_null() && !root.attributes.focus_well {
+        // If the root is the focused node, it should of course not move upward.
+        while !root.attributes.focus_well {
+            if root.attributes.focus_void {
+                focused_start = root;
+            }
+            if root.parent.is_null() {
+                break;
+            }
             root = Tree::node_ref(root.parent).unwrap();
-        }
-
-        let mut last_node_in_window = root;
-        while !last_node_in_window.children.last.is_null() {
-            last_node_in_window = unsafe { &*last_node_in_window.children.last };
         }
 
         // If the window doesn't contain any nodes, there's nothing to focus.
         // This also protects against infinite loops below.
-        if ptr::eq(root, last_node_in_window) {
+        if root.children.first.is_null() {
             return false;
         }
 
-        if !focused.attributes.focusable {
-            debug_assert!(false);
-            return false;
-        }
-
-        let mut focused_next = focused as *const _;
-        Tree::visit_all(root, focused, usize::MAX / 2, forward, |_, node| {
-            if node.attributes.focusable && !ptr::eq(node, root) && !ptr::eq(node, focused) {
-                focused_next = node;
+        Tree::visit_all(root, focused_start, usize::MAX / 2, forward, |_, node| {
+            if node.attributes.focusable && !ptr::eq(node, root) && !ptr::eq(node, focused_start) {
+                focused_next = trust_me_bro::this_lifetime_change_is_totally_safe(node);
                 VisitControl::Stop
+            } else if node.attributes.focus_void {
+                VisitControl::SkipChildren
             } else {
                 VisitControl::Continue
             }
         });
 
-        if ptr::eq(focused_next, focused) {
+        if ptr::eq(focused_next, focused_start) {
             false
         } else {
-            Tui::build_node_path(
-                unsafe { focused_next.as_ref() },
-                &mut self.focused_node_path,
-            );
+            Tui::build_node_path(Some(focused_next), &mut self.focused_node_path);
             true
         }
     }
@@ -1058,8 +1057,10 @@ impl Context<'_, '_> {
     }
 
     fn steal_focus_for(&mut self, node: &Node) {
-        self.needs_settling = true;
-        Tui::build_node_path(Some(node), &mut self.tui.focused_node_path);
+        if !self.tui.is_node_focused(node.id) {
+            Tui::build_node_path(Some(node), &mut self.tui.focused_node_path);
+            self.needs_settling = true;
+        }
     }
 
     pub fn toss_focus_up(&mut self) {
@@ -1986,7 +1987,6 @@ impl Context<'_, '_> {
 
     pub fn list_begin(&mut self, classname: &'static str) {
         self.block_begin(classname);
-        self.attr_focusable();
 
         let last_node = self.tree.last_node_mut();
         let content = self
@@ -1996,15 +1996,15 @@ impl Context<'_, '_> {
                 NodeContent::List(content) => Some(ListContent {
                     selected: content.selected,
                     selected_node: ptr::null(),
-                    selection_changed: false,
                 }),
                 _ => None,
             })
             .unwrap_or_else(|| ListContent {
                 selected: 0,
                 selected_node: ptr::null(),
-                selection_changed: false,
             });
+
+        last_node.attributes.focus_void = true;
         last_node.content = NodeContent::List(content);
     }
 
@@ -2045,7 +2045,7 @@ impl Context<'_, '_> {
             content.selected_node = item;
             if !selected_before {
                 content.selected = item_id;
-                content.selection_changed = true;
+                self.needs_settling = true;
             }
         }
 
@@ -2071,13 +2071,11 @@ impl Context<'_, '_> {
             _ => panic!(),
         };
 
-        let mut selected_next = ptr::null();
+        let mut selected_next = content.selected_node;
 
         if content.selected_node.is_null() && !list.children.first.is_null() {
             selected_next = list.children.first;
-        }
-
-        if !content.selected_node.is_null()
+        } else if !content.selected_node.is_null()
             && !self.input_consumed
             && (self.input_keyboard == Some(vk::UP) || self.input_keyboard == Some(vk::DOWN))
             && self.contains_focus()
@@ -2099,21 +2097,22 @@ impl Context<'_, '_> {
             selected_next = node;
         }
 
-        if let Some(next) = Tree::node_ref(selected_next) {
-            content.selected_node = next;
-            content.selection_changed = true;
+        let has_focus = self.tui.is_subtree_focused(list.id);
+        let Some(node) = Tree::node_mut(selected_next) else {
+            return;
+        };
+
+        // Now that we know which item is selected we can mark it as such.
+        if let NodeContent::Text(content) = &mut node.content {
+            unsafe {
+                content.chunks[0].text.as_bytes_mut()[0] = b'>';
+            }
         }
 
-        if let Some(node) = Tree::node_mut(content.selected_node) {
+        // If the list has focus, we also delegate focus to the selected item and colorize it.
+        if has_focus {
             node.attributes.bg = self.indexed(IndexedColor::Green);
-            if let NodeContent::Text(content) = &mut node.content {
-                unsafe {
-                    content.chunks[0].text.as_bytes_mut()[0] = b'>';
-                }
-            }
-            if content.selection_changed {
-                self.steal_focus_for(node);
-            }
+            self.steal_focus_for(node);
         }
     }
 
@@ -2577,14 +2576,14 @@ struct Attributes {
     fg: u32,
     bordered: bool,
     focusable: bool,
-    focus_well: bool,
+    focus_well: bool, // Prevents focus from leaving via Tab
+    focus_void: bool, // Prevents focus from entering via Tab
     focus_brackets: bool,
 }
 
 struct ListContent {
     selected: u64,
     selected_node: *const Node, // Points to the Node that holds this ListContent instance, if any.
-    selection_changed: bool,
 }
 
 struct TableContent {
