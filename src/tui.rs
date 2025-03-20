@@ -873,7 +873,7 @@ impl Tui {
         // The ROOT_ID node has no parent, and the others have a float attribute.
         // If the window is the focused node, it should of course not move upward.
         let mut root = focused;
-        while !root.parent.is_null() && root.attributes.float.is_none() {
+        while !root.parent.is_null() && !root.attributes.focus_well {
             root = Tree::node_ref(root.parent).unwrap();
         }
 
@@ -1026,6 +1026,11 @@ impl Context<'_, '_> {
         self.next_block_id_mixin = id;
     }
 
+    fn attr_focusable(&mut self) {
+        let last_node = self.tree.last_node_mut();
+        last_node.attributes.focusable = true;
+    }
+
     pub fn focus_on_first_present(&mut self) {
         let last_node = self.tree.last_node_mut();
         last_node.attributes.focusable = true;
@@ -1073,9 +1078,9 @@ impl Context<'_, '_> {
         }
     }
 
-    fn attr_focusable(&mut self) {
+    pub fn attr_focus_well(&mut self) {
         let last_node = self.tree.last_node_mut();
-        last_node.attributes.focusable = true;
+        last_node.attributes.focus_well = true;
     }
 
     pub fn attr_intrinsic_size(&mut self, size: Size) {
@@ -1101,6 +1106,7 @@ impl Context<'_, '_> {
         }
 
         last_node.parent = anchor;
+        last_node.attributes.focus_well = true;
         last_node.attributes.float = Some(FloatAttributes {
             gravity_x: spec.gravity_x.clamp(0.0, 1.0),
             gravity_y: spec.gravity_y.clamp(0.0, 1.0),
@@ -2308,6 +2314,10 @@ impl Tree {
         tree.append_child(Node {
             id: ROOT_ID,
             classname: "root",
+            attributes: Attributes {
+                focus_well: true,
+                ..Default::default()
+            },
             ..Default::default()
         });
         tree.root_first = tree.tail;
@@ -2527,6 +2537,7 @@ struct Attributes {
     fg: u32,
     bordered: bool,
     focusable: bool,
+    focus_well: bool,
     focus_brackets: bool,
 }
 
