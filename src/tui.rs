@@ -153,13 +153,14 @@ impl Tui {
             }
             Some(input::Input::Text(text)) => {
                 input_text = Some(text);
-                if !text.bracketed
-                    && text.text.len() == 1
-                    && (b'a'..=b'z').contains(&text.text.as_bytes()[0])
-                {
-                    let ch = text.text.as_bytes()[0] as u32;
-                    let ch = ch & !0x20; // Uppercase.
-                    input_keyboard = Some(InputKey::new(ch));
+                // TODO: the .len()==1 check causes us to ignore keyboard inputs that are faster than we process them.
+                // For instance, imagine the user presses "A" twice and we happen to read it in a single chunk.
+                // This causes us to ignore the keyboard input here. We need a way to inform the caller over
+                // how much of the input text we actually processed in a single frame. Or perhaps we could use
+                // the needs_settling logic?
+                if !text.bracketed && text.text.len() == 1 {
+                    let ch = text.text.as_bytes()[0];
+                    input_keyboard = InputKey::from_ascii(ch as char)
                 }
             }
             Some(input::Input::Keyboard(keyboard)) => {

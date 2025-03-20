@@ -14,6 +14,18 @@ impl InputKey {
         Self(v)
     }
 
+    pub const fn from_ascii(ch: char) -> Option<Self> {
+        if ch == ' ' || (ch >= '0' && ch <= '9') {
+            Some(Self(ch as u32))
+        } else if ch >= 'a' && ch <= 'z' {
+            Some(Self(ch as u32 & !0x20)) // Shift a-z to A-Z
+        } else if ch >= 'A' && ch <= 'Z' {
+            Some(Self(kbmod::SHIFT.0 | ch as u32))
+        } else {
+            None
+        }
+    }
+
     pub const fn value(&self) -> u32 {
         self.0
     }
@@ -80,7 +92,7 @@ pub mod vk {
     pub const TAB: InputKey = InputKey::new(0x09);
     pub const RETURN: InputKey = InputKey::new(0x0D);
     pub const ESCAPE: InputKey = InputKey::new(0x1B);
-    pub const SPACE: InputKey = InputKey::new(0x20);
+    pub const SPACE: InputKey = InputKey::new(' ' as u32);
     pub const PRIOR: InputKey = InputKey::new(0x21);
     pub const NEXT: InputKey = InputKey::new(0x22);
 
@@ -94,6 +106,17 @@ pub mod vk {
 
     pub const INSERT: InputKey = InputKey::new(0x2D);
     pub const DELETE: InputKey = InputKey::new(0x2E);
+
+    pub const N0: InputKey = InputKey::new('0' as u32);
+    pub const N1: InputKey = InputKey::new('1' as u32);
+    pub const N2: InputKey = InputKey::new('2' as u32);
+    pub const N3: InputKey = InputKey::new('3' as u32);
+    pub const N4: InputKey = InputKey::new('4' as u32);
+    pub const N5: InputKey = InputKey::new('5' as u32);
+    pub const N6: InputKey = InputKey::new('6' as u32);
+    pub const N7: InputKey = InputKey::new('7' as u32);
+    pub const N8: InputKey = InputKey::new('8' as u32);
+    pub const N9: InputKey = InputKey::new('9' as u32);
 
     pub const A: InputKey = InputKey::new('A' as u32);
     pub const B: InputKey = InputKey::new('B' as u32);
