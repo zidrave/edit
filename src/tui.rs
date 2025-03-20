@@ -1975,21 +1975,26 @@ impl Context<'_, '_> {
         self.attr_focusable();
 
         let last_node = self.tree.last_node_mut();
-        let selected = self
+        let content = self
             .tui
             .get_prev_node(last_node.id)
-            .map_or(0, |n| match &n.content {
-                NodeContent::List(content) => content.selected,
-                _ => 0,
+            .and_then(|n| match &n.content {
+                NodeContent::List(content) => Some(ListContent {
+                    selected: content.selected,
+                    selected_node: ptr::null(),
+                    selection_changed: false,
+                }),
+                _ => None,
+            })
+            .unwrap_or_else(|| ListContent {
+                selected: 0,
+                selected_node: ptr::null(),
+                selection_changed: false,
             });
-        last_node.content = NodeContent::List(ListContent {
-            selected,
-            selected_node: ptr::null(),
-            selection_changed: false,
-        });
+        last_node.content = NodeContent::List(content);
     }
 
-    pub fn list_item(&mut self, select: bool, overflow: Overflow, text: &str) -> bool {
+    pub fn list_item(&mut self, select: bool, overflow: Overflow, text: &str) -> ListSelection {
         let list = self.tree.current_node_mut();
         let content = match &mut list.content {
             NodeContent::List(content) => content,
@@ -2004,11 +2009,10 @@ impl Context<'_, '_> {
         let item = self.tree.last_node_ref();
         let item_id = item.id;
         let selected_before = content.selected == item_id;
-        let mut selected_now = selected_before;
 
         // Clicking an item activates it
         let clicked = !self.input_consumed
-            && (self.input_mouse_gesture == InputMouseGesture::Click && self.is_hovering());
+            && (self.input_mouse_gesture == InputMouseGesture::DoubleClick && self.is_hovering());
         // Pressing Enter on a selected item activates it as well
         let entered = selected_before
             && !self.input_consumed
@@ -2019,25 +2023,29 @@ impl Context<'_, '_> {
         }
 
         // Inherit the default selection & Click changes selection
-        if (select && content.selected == 0) || (!selected_now && clicked) {
-            selected_now = true;
-            content.selected = item_id;
-            content.selection_changed = true;
-        }
+        let selected_now =
+            selected_before || (select && content.selected == 0) || self.is_focused();
 
         // Note down the selected node for keyboard navigation.
         if selected_now {
             content.selected_node = item;
+            if !selected_before {
+                content.selected = item_id;
+                content.selection_changed = true;
+            }
         }
 
-        if selected_now {
-            self.attr_background_rgba(self.indexed(IndexedColor::Green));
-        }
-        self.styled_label_add_text(if selected_now { "> " } else { "  " });
+        self.styled_label_add_text("  ");
         self.styled_label_add_text(text);
         self.styled_label_end();
 
-        selected_before && activated
+        if selected_before && activated {
+            ListSelection::Activated
+        } else if selected_now && !selected_before {
+            ListSelection::Selected
+        } else {
+            ListSelection::Unchanged
+        }
     }
 
     pub fn list_end(&mut self) {
@@ -2049,11 +2057,10 @@ impl Context<'_, '_> {
             _ => panic!(),
         };
 
+        let mut selected_next = ptr::null();
+
         if content.selected_node.is_null() && !list.children.first.is_null() {
-            let node = Tree::node_ref(list.children.first).unwrap();
-            content.selected = node.id;
-            content.selected_node = node;
-            content.selection_changed = true;
+            selected_next = list.children.first;
         }
 
         if !content.selected_node.is_null()
@@ -2063,28 +2070,35 @@ impl Context<'_, '_> {
         {
             let selected = Tree::node_ref(content.selected_node).unwrap();
             let forward = self.input_keyboard == Some(vk::DOWN);
-            let mut next = if forward {
+            let mut node = if forward {
                 selected.siblings.next
             } else {
                 selected.siblings.prev
             };
-            if next.is_null() {
-                next = if forward {
+            if node.is_null() {
+                node = if forward {
                     list.children.first
                 } else {
                     list.children.last
                 };
             }
-            if let Some(next) = Tree::node_ref(next) {
-                content.selected = next.id;
-                content.selected_node = next;
-                content.selection_changed = true;
-            }
+            selected_next = node;
         }
 
-        if content.selection_changed {
-            if let Some(item) = Tree::node_ref(content.selected_node) {
-                self.steal_focus_for(item);
+        if let Some(next) = Tree::node_ref(selected_next) {
+            content.selected_node = next;
+            content.selection_changed = true;
+        }
+
+        if let Some(node) = Tree::node_mut(content.selected_node) {
+            node.attributes.bg = self.indexed(IndexedColor::Green);
+            if let NodeContent::Text(content) = &mut node.content {
+                unsafe {
+                    content.chunks[0].text.as_bytes_mut()[0] = b'>';
+                }
+            }
+            if content.selection_changed {
+                self.steal_focus_for(node);
             }
         }
     }
@@ -2509,6 +2523,13 @@ struct FloatAttributes {
     gravity_y: f32,
     // Specifies an offset from the origin in cells.
     offset: Point,
+}
+
+#[derive(PartialEq, Eq)]
+pub enum ListSelection {
+    Unchanged,
+    Selected,
+    Activated,
 }
 
 #[derive(Default)]

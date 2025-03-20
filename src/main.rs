@@ -615,14 +615,16 @@ fn draw_statusbar(ctx: &mut Context, state: &mut State) {
                         state.buffer.indent_with_tabs(),
                         Overflow::Clip,
                         loc(LocId::IndentationTabs),
-                    ) {
+                    ) != ListSelection::Unchanged
+                    {
                         state.buffer.set_indent_with_tabs(true);
                     }
                     if ctx.list_item(
                         !state.buffer.indent_with_tabs(),
                         Overflow::Clip,
                         loc(LocId::IndentationSpaces),
-                    ) {
+                    ) != ListSelection::Unchanged
+                    {
                         state.buffer.set_indent_with_tabs(false);
                     }
                 }
@@ -639,7 +641,8 @@ fn draw_statusbar(ctx: &mut Context, state: &mut State) {
                             state.buffer.tab_size() == width as i32,
                             Overflow::Clip,
                             label,
-                        ) {
+                        ) != ListSelection::Unchanged
+                        {
                             state.buffer.set_tab_size(width as i32);
                         }
                     }
@@ -678,13 +681,13 @@ fn draw_statusbar(ctx: &mut Context, state: &mut State) {
             ctx.label("dirty", Overflow::Clip, "*");
         }
 
-        ctx.block_begin("indirection");
+        ctx.block_begin("filename-container");
         ctx.attr_intrinsic_size(Size {
             width: COORD_TYPE_SAFE_MAX,
             height: 1,
         });
         {
-            ctx.label("exit", Overflow::TruncateMiddle, &state.save_filename);
+            ctx.label("filename", Overflow::TruncateMiddle, &state.filename);
             ctx.attr_position(Position::Right);
         }
         ctx.block_end();
@@ -882,7 +885,8 @@ fn draw_dialog_encoding_change(ctx: &mut Context, state: &mut State) {
                     encoding.as_str() == state.buffer.encoding(),
                     Overflow::Clip,
                     encoding.as_str(),
-                ) {
+                ) == ListSelection::Activated
+                {
                     state.wants_encoding_change = StateEncodingChange::None;
                     if reopen && state.path.is_some() {
                         if state.buffer.is_dirty() {
