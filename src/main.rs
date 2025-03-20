@@ -72,12 +72,11 @@ impl Drop for RestoreModes {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy)]
 enum StateSearch {
     Hidden,
-    Focus,
-    Shown,
     Disabled,
+    Visible { focus: bool },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -302,7 +301,7 @@ fn run() -> apperr::Result<()> {
 
 fn draw(ctx: &mut Context, state: &mut State) {
     draw_menubar(ctx, state);
-    if state.wants_search != StateSearch::Hidden {
+    if matches!(state.wants_search, StateSearch::Visible { .. }) {
         draw_search(ctx, state);
     }
     draw_editor(ctx, state);
@@ -346,8 +345,10 @@ fn draw(ctx: &mut Context, state: &mut State) {
     if ctx.consume_shortcut(kbmod::CTRL | vk::Q) {
         state.wants_exit = true;
     }
-    if state.wants_search != StateSearch::Disabled && ctx.consume_shortcut(kbmod::CTRL | vk::F) {
-        state.wants_search = StateSearch::Focus;
+    if !matches!(state.wants_search, StateSearch::Disabled)
+        && ctx.consume_shortcut(kbmod::CTRL | vk::F)
+    {
+        state.wants_search = StateSearch::Visible { focus: true };
     }
 }
 
@@ -400,10 +401,10 @@ fn draw_menu_edit(ctx: &mut Context, state: &mut State) {
     if ctx.menubar_menu_item(loc(LocId::EditPaste), 'P', kbmod::CTRL | vk::V) {
         state.buffer.write(ctx.get_clipboard());
     }
-    if state.wants_search != StateSearch::Disabled
+    if !matches!(state.wants_search, StateSearch::Disabled)
         && ctx.menubar_menu_item(loc(LocId::EditFind), 'F', kbmod::CTRL | vk::F)
     {
-        state.wants_search = StateSearch::Focus;
+        state.wants_search = StateSearch::Visible { focus: true };
     }
     ctx.menubar_menu_end();
 }
@@ -448,8 +449,8 @@ fn draw_search(ctx: &mut Context, state: &mut State) {
                 width: COORD_TYPE_SAFE_MAX,
                 height: 1,
             });
-            if state.wants_search == StateSearch::Focus {
-                state.wants_search = StateSearch::Shown;
+            if matches!(state.wants_search, StateSearch::Visible { focus: true }) {
+                state.wants_search = StateSearch::Visible { focus: false };
                 ctx.steal_focus();
             }
             search_next = ctx.is_focused() && ctx.consume_shortcut(vk::RETURN);
@@ -489,7 +490,7 @@ fn draw_search(ctx: &mut Context, state: &mut State) {
             );
             if change {
                 search_next = true;
-                state.wants_search = StateSearch::Focus;
+                state.wants_search = StateSearch::Visible { focus: true };
             }
         }
         ctx.table_end();
@@ -513,7 +514,7 @@ fn draw_editor(ctx: &mut Context, state: &mut State) {
     let size = ctx.size();
     // TODO: The layout code should be able to just figure out the height on its own.
     let mut height_reduction = 2;
-    if state.wants_search != StateSearch::Hidden {
+    if matches!(state.wants_search, StateSearch::Visible { .. }) {
         height_reduction += 2;
     }
     ctx.textarea("textarea", state.buffer.clone());
