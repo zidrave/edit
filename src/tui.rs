@@ -1759,98 +1759,83 @@ impl Context<'_, '_> {
                         tb.cursor_move_delta(granularity, 1);
                     }
                 }
-                vk::DOWN => {
-                    match modifiers {
-                        kbmod::NONE => {
-                            // If the cursor was already on the last line,
-                            // move it to the end of the buffer.
-                            if tb.get_cursor_visual_pos().y >= tb.get_visual_line_count() - 1 {
-                                content.preferred_column = CoordType::MAX;
-                            }
-
-                            tb.cursor_move_to_visual(Point {
-                                x: content.preferred_column,
-                                y: tb.get_cursor_visual_pos().y + 1,
-                            });
-
-                            if content.preferred_column == CoordType::MAX {
-                                content.preferred_column = tb.get_cursor_visual_pos().x;
-                            }
+                vk::DOWN => match modifiers {
+                    kbmod::NONE => {
+                        // If the cursor was already on the last line,
+                        // move it to the end of the buffer.
+                        if tb.get_cursor_visual_pos().y >= tb.get_visual_line_count() - 1 {
+                            content.preferred_column = CoordType::MAX;
                         }
-                        kbmod::CTRL => {
-                            content.scroll_offset.y += 1;
-                            make_cursor_visible = false;
-                        }
-                        kbmod::SHIFT => {
-                            // If the cursor was already on the last line,
-                            // move it to the end of the buffer.
-                            if tb.get_cursor_visual_pos().y >= tb.get_visual_line_count() - 1 {
-                                content.preferred_column = CoordType::MAX;
-                            }
 
-                            tb.selection_update_visual(Point {
-                                x: content.preferred_column,
-                                y: tb.get_cursor_visual_pos().y + 1,
-                            });
+                        tb.cursor_move_to_visual(Point {
+                            x: content.preferred_column,
+                            y: tb.get_cursor_visual_pos().y + 1,
+                        });
 
-                            if content.preferred_column == CoordType::MAX {
-                                content.preferred_column = tb.get_cursor_visual_pos().x;
-                            }
+                        if content.preferred_column == CoordType::MAX {
+                            content.preferred_column = tb.get_cursor_visual_pos().x;
                         }
-                        kbmod::CTRL_ALT => {
-                            // TODO: Add cursor above
-                        }
-                        _ => return false,
                     }
-                }
-                vk::INSERT => {
-                    tb.set_overtype(!tb.is_overtype());
-                }
-                vk::DELETE => {
-                    let granularity = if modifiers == kbmod::CTRL {
-                        CursorMovement::Word
-                    } else {
-                        CursorMovement::Grapheme
-                    };
-                    tb.delete(granularity, 1);
-                }
-                vk::A => {
-                    match modifiers {
-                        kbmod::CTRL => tb.select_all(),
-                        _ => return false,
-                    };
-                }
-                vk::X => {
-                    match modifiers {
-                        kbmod::CTRL => self.tui.clipboard = tb.extract_selection(true),
-                        _ => return false,
-                    };
-                }
-                vk::C => {
-                    match modifiers {
-                        kbmod::CTRL => self.tui.clipboard = tb.extract_selection(false),
-                        _ => return false,
-                    };
-                }
-                vk::V => {
-                    match modifiers {
-                        kbmod::CTRL => tb.write(&self.tui.clipboard),
-                        _ => return false,
-                    };
-                }
-                vk::Y => {
-                    match modifiers {
-                        kbmod::CTRL => tb.redo(),
-                        _ => return false,
-                    };
-                }
-                vk::Z => {
-                    match modifiers {
-                        kbmod::CTRL => tb.undo(),
-                        kbmod::ALT => tb.toggle_word_wrap(),
-                        _ => return false,
-                    };
-                }
+                    kbmod::CTRL => {
+                        content.scroll_offset.y += 1;
+                        make_cursor_visible = false;
+                    }
+                    kbmod::SHIFT => {
+                        // If the cursor was already on the last line,
+                        // move it to the end of the buffer.
+                        if tb.get_cursor_visual_pos().y >= tb.get_visual_line_count() - 1 {
+                            content.preferred_column = CoordType::MAX;
+                        }
+
+                        tb.selection_update_visual(Point {
+                            x: content.preferred_column,
+                            y: tb.get_cursor_visual_pos().y + 1,
+                        });
+
+                        if content.preferred_column == CoordType::MAX {
+                            content.preferred_column = tb.get_cursor_visual_pos().x;
+                        }
+                    }
+                    kbmod::CTRL_ALT => {
+                        // TODO: Add cursor above
+                    }
+                    _ => return false,
+                },
+                vk::INSERT => match modifiers {
+                    kbmod::SHIFT => tb.write(&self.tui.clipboard),
+                    kbmod::CTRL => self.tui.clipboard = tb.extract_selection(false),
+                    _ => tb.set_overtype(!tb.is_overtype()),
+                },
+                vk::DELETE => match modifiers {
+                    kbmod::SHIFT => self.tui.clipboard = tb.extract_selection(true),
+                    kbmod::CTRL => tb.delete(CursorMovement::Word, 1),
+                    _ => tb.delete(CursorMovement::Grapheme, 1),
+                },
+                vk::A => match modifiers {
+                    kbmod::CTRL => tb.select_all(),
+                    _ => return false,
+                },
+                vk::X => match modifiers {
+                    kbmod::CTRL => self.tui.clipboard = tb.extract_selection(true),
+                    _ => return false,
+                },
+                vk::C => match modifiers {
+                    kbmod::CTRL => self.tui.clipboard = tb.extract_selection(false),
+                    _ => return false,
+                },
+                vk::V => match modifiers {
+                    kbmod::CTRL => tb.write(&self.tui.clipboard),
+                    _ => return false,
+                },
+                vk::Y => match modifiers {
+                    kbmod::CTRL => tb.redo(),
+                    _ => return false,
+                },
+                vk::Z => match modifiers {
+                    kbmod::CTRL => tb.undo(),
+                    kbmod::ALT => tb.toggle_word_wrap(),
+                    _ => return false,
+                },
                 _ => return false,
             }
 
