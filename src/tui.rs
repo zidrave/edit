@@ -11,14 +11,6 @@ use std::ptr::{self, null};
 
 const ROOT_ID: u64 = 0x14057B7EF767814F; // Knuth's MMIX constant
 
-#[derive(PartialEq, Eq)]
-pub enum Overflow {
-    Clip,
-    TruncateHead,
-    TruncateMiddle,
-    TruncateTail,
-}
-
 type InputText<'input> = input::InputText<'input>;
 type InputKey = input::InputKey;
 type InputMouseState = input::InputMouseState;
@@ -41,6 +33,7 @@ enum RefinedInput<'a> {
 enum InputMouseGesture {
     None,
     Click,
+    DoubleClick,
     Drag(Point),
 }
 
@@ -62,6 +55,8 @@ pub struct Tui {
     mouse_down_position: Point,
     /// Last known mouse state.
     mouse_state: InputMouseState,
+    last_click: std::time::Instant,
+    last_click_target: u64,
 
     clipboard: Vec<u8>,
     cached_text_buffers: Vec<CachedTextBuffer>,
@@ -90,6 +85,8 @@ impl Tui {
             mouse_position: Point::MIN,
             mouse_down_position: Point::MIN,
             mouse_state: InputMouseState::None,
+            last_click: std::time::Instant::now(),
+            last_click_target: 0,
 
             clipboard: Vec::new(),
             cached_text_buffers: Vec::with_capacity(16),
@@ -135,6 +132,7 @@ impl Tui {
             self.needs_settling();
         }
 
+        let now = std::time::Instant::now();
         let mut input_consumed = false;
         let mut input_text = None;
         let mut input_keyboard = None;
@@ -215,7 +213,18 @@ impl Tui {
                 {
                     // Mouse down and up happened at the same position = Click.
                     // TODO: This should instead check if the focus stack is the same as on mouse-down.
-                    InputMouseGesture::Click
+                    // TODO: This should check if the last action was a Click as well (and not keyboard input).
+                    let click_target = unsafe { focused_node.as_ref() }.map(|n| n.id).unwrap_or(0);
+                    let action = if (now - self.last_click) <= std::time::Duration::from_millis(500)
+                        && self.last_click_target == click_target
+                    {
+                        InputMouseGesture::DoubleClick
+                    } else {
+                        InputMouseGesture::Click
+                    };
+                    self.last_click = now;
+                    self.last_click_target = click_target;
+                    action
                 } else if self.mouse_state == InputMouseState::Left
                     && next_state == InputMouseState::Left
                     && next_position != self.mouse_position
@@ -246,7 +255,7 @@ impl Tui {
         Context {
             tui: self,
 
-            time: std::time::Instant::now(),
+            now,
             input_text,
             input_keyboard,
             input_mouse_modifiers,
@@ -949,7 +958,7 @@ impl Tui {
 pub struct Context<'tui, 'input> {
     tui: &'tui mut Tui,
 
-    time: std::time::Instant,
+    now: std::time::Instant,
     /// Current text input, if any.
     input_text: Option<InputText<'input>>,
     /// Current keyboard input, if any.
@@ -1428,7 +1437,6 @@ impl Context<'_, '_> {
         let mut content = TextareaContent {
             buffer,
             scroll_offset: Point::default(),
-            last_click: self.time,
             preferred_column: 0,
             single_line,
             has_focus: self.tui.is_node_focused(node.id),
@@ -1438,7 +1446,6 @@ impl Context<'_, '_> {
             if let NodeContent::Textarea(content_prev) = &node_prev.content {
                 content.scroll_offset = content_prev.scroll_offset;
                 content.preferred_column = content_prev.preferred_column;
-                content.last_click = content_prev.last_click;
 
                 let mut text_width = node_prev.inner.width();
                 if !single_line {
@@ -2528,6 +2535,15 @@ pub enum Position {
     Right,
 }
 
+#[derive(PartialEq, Eq, Default)]
+pub enum Overflow {
+    #[default]
+    Clip,
+    TruncateHead,
+    TruncateMiddle,
+    TruncateTail,
+}
+
 #[derive(Default)]
 struct Attributes {
     float: Option<FloatAttributes>,
@@ -2588,8 +2604,6 @@ struct TextareaContent {
     buffer: RcTextBuffer,
     scroll_offset: Point,
     preferred_column: CoordType,
-    // TODO: Double click detection should be in `Tui`.
-    last_click: std::time::Instant,
     single_line: bool,
     has_focus: bool,
 }
