@@ -943,12 +943,12 @@ impl Tui {
         let mut scroll_to = focused.outer;
 
         while !scrollarea.parent.is_null() && scrollarea.attributes.float.is_none() {
-            if let NodeContent::Scrollarea(scroll_offset) = &mut scrollarea.content {
-                let mut scroll_y = scroll_offset.y;
-                scroll_y = scroll_y.min(scroll_to.top - scrollarea.inner.top + scroll_offset.y);
-                scroll_y =
-                    scroll_y.max(scroll_to.bottom - scrollarea.inner.bottom + scroll_offset.y);
-                scroll_offset.y = scroll_y;
+            if let NodeContent::Scrollarea(off) = &mut scrollarea.content {
+                let off_y = off.y.max(0);
+                let mut y = off_y;
+                y = y.min(scroll_to.top - scrollarea.inner.top + off_y);
+                y = y.max(scroll_to.bottom - scrollarea.inner.bottom + off_y);
+                off.y = y;
                 scroll_to = scrollarea.outer;
             }
             scrollarea = Tree::node_mut(scrollarea.parent).unwrap();
@@ -1906,7 +1906,7 @@ impl Context<'_, '_> {
         self.block_begin(classname);
 
         let container = self.tree.last_node_mut();
-        container.content = NodeContent::Scrollarea(Default::default());
+        container.content = NodeContent::Scrollarea(Point::MIN);
 
         if intrinsic_size.width > 0 || intrinsic_size.height > 0 {
             container.intrinsic_size.width = intrinsic_size.width.max(0);
@@ -1942,9 +1942,7 @@ impl Context<'_, '_> {
             if *scroll_offset == Point::MIN {
                 if let NodeContent::Scrollarea(prev_offset) = &prev_container.content {
                     *scroll_offset = *prev_offset;
-                } else {
-                    debug_assert!(false);
-                };
+                }
             }
 
             if !self.input_consumed && self.tui.mouse_state != InputMouseState::None {

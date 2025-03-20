@@ -791,23 +791,26 @@ fn draw_dialog_saveas(ctx: &mut Context, state: &mut State) {
         );
         ctx.attr_background_rgba(ctx.indexed(IndexedColor::Cyan));
         ctx.next_block_id_mixin(state.save_pending_dir.as_str().len() as u64);
-        ctx.list_begin("files");
-        for entry in files.iter() {
-            match ctx.list_item(
-                state.save_pending_name == entry.as_str(),
-                Overflow::TruncateMiddle,
-                entry.as_str(),
-            ) {
-                ListSelection::Unchanged => {}
-                ListSelection::Selected => {
-                    state.save_pending_name = entry.as_str().to_string();
-                }
-                ListSelection::Activated => {
-                    state.wants_save = StateSave::Save;
+        {
+            ctx.list_begin("files");
+            ctx.inherit_focus();
+            for entry in files.iter() {
+                match ctx.list_item(
+                    state.save_pending_name == entry.as_str(),
+                    Overflow::TruncateMiddle,
+                    entry.as_str(),
+                ) {
+                    ListSelection::Unchanged => {}
+                    ListSelection::Selected => {
+                        state.save_pending_name = entry.as_str().to_string();
+                    }
+                    ListSelection::Activated => {
+                        state.wants_save = StateSave::Save;
+                    }
                 }
             }
+            ctx.list_end();
         }
-        ctx.list_end();
         ctx.scrollarea_end();
 
         if state.wants_save == StateSave::Save {
