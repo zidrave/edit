@@ -6,6 +6,9 @@ pub enum LocId {
     Alt,
     Shift,
 
+    Yes,
+    No,
+
     // File menu
     File,
     FileOpen,
@@ -60,6 +63,9 @@ pub enum LocId {
 
     SaveAsDialogPathLabel,
     SaveAsDialogNameLabel,
+
+    FileOverwriteWarning,
+    FileOverwriteWarningDescription,
 
     Count,
 }
@@ -128,6 +134,35 @@ const S_LANG_LUT: [[&str; LangId::Count as usize]; LocId::Count as usize] = [
         /* ru      */ "Shift",
         /* zh_hans */ "Shift",
         /* zh_hant */ "Shift",
+    ],
+
+    // Yes
+    [
+        /* en      */ "Yes",
+        /* de      */ "Ja",
+        /* es      */ "Sí",
+        /* fr      */ "Oui",
+        /* it      */ "Sì",
+        /* ja      */ "はい",
+        /* ko      */ "예",
+        /* pt_br   */ "Sim",
+        /* ru      */ "Да",
+        /* zh_hans */ "是",
+        /* zh_hant */ "是",
+    ],
+    // No
+    [
+        /* en      */ "No",
+        /* de      */ "Nein",
+        /* es      */ "No",
+        /* fr      */ "Non",
+        /* it      */ "No",
+        /* ja      */ "いいえ",
+        /* ko      */ "아니오",
+        /* pt_br   */ "Não",
+        /* ru      */ "Нет",
+        /* zh_hans */ "否",
+        /* zh_hant */ "否",
     ],
 
     // File
@@ -685,6 +720,35 @@ const S_LANG_LUT: [[&str; LangId::Count as usize]; LocId::Count as usize] = [
         /* ru      */ "Имя файла:",
         /* zh_hans */ "文件名:",
         /* zh_hant */ "檔案名稱:",
+    ],
+
+    // FileOverwriteWarning
+    [
+        /* en      */ "Confirm Save As",
+        /* de      */ "Speichern unter bestätigen",
+        /* es      */ "Confirmar Guardar como",
+        /* fr      */ "Confirmer Enregistrer sous",
+        /* it      */ "Conferma Salva con nome",
+        /* ja      */ "名前を付けて保存の確認",
+        /* ko      */ "다른 이름으로 저장 확인",
+        /* pt_br   */ "Confirmar Salvar como",
+        /* ru      */ "Подтвердите «Сохранить как…»",
+        /* zh_hans */ "确认另存为",
+        /* zh_hant */ "確認另存新檔",
+    ],
+    // FileOverwriteWarningDescription
+    [
+        /* en      */ "File already exists. Do you want to overwrite it?",
+        /* de      */ "Datei existiert bereits. Möchten Sie sie überschreiben?",
+        /* es      */ "El archivo ya existe. ¿Desea sobrescribirlo?",
+        /* fr      */ "Le fichier existe déjà. Voulez-vous l’écraser?",
+        /* it      */ "Il file esiste già. Vuoi sovrascriverlo?",
+        /* ja      */ "ファイルは既に存在します。上書きしますか？",
+        /* ko      */ "파일이 이미 존재합니다. 덮어쓰시겠습니까?",
+        /* pt_br   */ "O arquivo já existe. Deseja sobrescrevê-lo?",
+        /* ru      */ "Файл уже существует. Перезаписать?",
+        /* zh_hans */ "文件已存在。要覆盖它吗？",
+        /* zh_hant */ "檔案已存在。要覆蓋它嗎？",
     ],
 ];
 

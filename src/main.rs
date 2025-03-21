@@ -39,7 +39,7 @@ use crate::loc::{LocId, loc};
 use crate::tui::*;
 use crate::vt::Token;
 use std::fs::File;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::{cmp, process};
 
 #[cfg(feature = "debug-latency")]
@@ -98,6 +98,7 @@ struct State {
     file_picker_pending_dir: DisplayablePathBuf,
     file_picker_pending_name: String, // This could be PathBuf, if `tui` would expose its TextBuffer for editline.
     file_picker_entries: Option<Vec<DisplayablePathBuf>>,
+    file_picker_overwrite_warning: Option<PathBuf>, // The path the warning is about.
 
     wants_search: StateSearch,
     search_needle: String,
@@ -145,6 +146,7 @@ impl State {
             file_picker_pending_dir: DisplayablePathBuf::new(std::env::current_dir()?),
             file_picker_pending_name: filename,
             file_picker_entries: None,
+            file_picker_overwrite_warning: None,
 
             wants_search: StateSearch::Hidden,
             search_needle: String::new(),
@@ -735,6 +737,7 @@ fn draw_file_picker(ctx: &mut Context, state: &mut State) {
 
     let width = (ctx.size().width - 20).max(10);
     let height = (ctx.size().height - 10).max(10);
+    let mut save_path = None;
 
     ctx.modal_begin(
         "file-picker",
@@ -828,24 +831,79 @@ fn draw_file_picker(ctx: &mut Context, state: &mut State) {
 
         if activated {
             if let Some(path) = draw_dialog_saveas_update_path(state) {
-                let success = if state.wants_file_picker == StateFilePicker::Open {
-                    draw_handle_load(state, Some(&path), None)
+                if state.wants_file_picker == StateFilePicker::Open {
+                    if draw_handle_load(state, Some(&path), None) {
+                        save_path = Some(path);
+                    }
+                } else if path.exists() && Some(&path) != state.path.as_ref() {
+                    state.file_picker_overwrite_warning = Some(path);
                 } else {
-                    draw_handle_save(state, Some(&path))
+                    if draw_handle_save(state, Some(&path)) {
+                        save_path = Some(path);
+                    }
                 };
-                // Only update the path if the save was successful.
-                if success {
-                    state.path = Some(path);
-                    state.filename = state.file_picker_pending_name.clone();
-                    state.wants_file_picker = StateFilePicker::None;
-                }
-            } else {
-                state.wants_file_picker = StateFilePicker::SaveAs;
             }
         }
     }
     if ctx.modal_end() {
         state.wants_file_picker = StateFilePicker::None;
+    }
+
+    if state.file_picker_overwrite_warning.is_some() {
+        let mut save;
+
+        ctx.modal_begin("overwrite", loc(LocId::FileOverwriteWarning));
+        ctx.attr_background_rgba(ctx.indexed(IndexedColor::Red));
+        {
+            ctx.label(
+                "description",
+                Overflow::TruncateTail,
+                loc(LocId::FileOverwriteWarningDescription),
+            );
+            ctx.attr_padding(Rect::three(1, 2, 1));
+
+            ctx.table_begin("choices");
+            ctx.attr_padding(Rect::three(0, 2, 1));
+            ctx.attr_position(Position::Center);
+            ctx.table_set_cell_gap(Size {
+                width: 2,
+                height: 0,
+            });
+            {
+                ctx.table_next_row();
+
+                save = ctx.button("yes", Overflow::Clip, loc(LocId::Yes));
+                ctx.focus_on_first_present();
+                if ctx.button("no", Overflow::Clip, loc(LocId::No)) {
+                    state.file_picker_overwrite_warning = None;
+                }
+            }
+            ctx.table_end();
+
+            save |= ctx.consume_shortcut(vk::Y);
+            if ctx.consume_shortcut(vk::N) {
+                state.file_picker_overwrite_warning = None;
+            }
+        }
+        if ctx.modal_end() {
+            state.file_picker_overwrite_warning = None;
+        }
+
+        if save {
+            let path = state.file_picker_overwrite_warning.take();
+            if draw_handle_save(state, path.as_ref()) {
+                save_path = path;
+            }
+            state.file_picker_overwrite_warning = None;
+        }
+    }
+
+    if save_path.is_some() {
+        // Only update the path if the save was successful.
+        state.path = save_path;
+        state.filename = state.file_picker_pending_name.clone();
+        state.wants_file_picker = StateFilePicker::None;
+        state.file_picker_entries = None;
     }
 }
 
@@ -853,19 +911,21 @@ fn draw_file_picker(ctx: &mut Context, state: &mut State) {
 fn draw_dialog_saveas_update_path(state: &mut State) -> Option<PathBuf> {
     let path = state.file_picker_pending_dir.as_path();
     let path = path.join(&state.file_picker_pending_name);
-    let path = match sys::canonicalize(path) {
-        Ok(path) => path,
-        Err(err) => {
-            error_log_add(state, err.into());
-            return None;
-        }
-    };
+    let mut normalized = PathBuf::new();
 
-    let (dir, name) = if path.is_dir() {
-        (path.as_path(), String::new())
+    for c in path.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => _ = normalized.pop(),
+            _ => normalized.push(c.as_os_str()),
+        }
+    }
+
+    let (dir, name) = if normalized.is_dir() {
+        (normalized.as_path(), String::new())
     } else {
-        let dir = path.parent().unwrap_or(&path);
-        let name = path
+        let dir = normalized.parent().unwrap_or(&normalized);
+        let name = normalized
             .file_name()
             .unwrap_or_default()
             .to_string_lossy()
@@ -881,7 +941,7 @@ fn draw_dialog_saveas_update_path(state: &mut State) -> Option<PathBuf> {
     if state.file_picker_pending_name.is_empty() {
         None
     } else {
-        Some(path)
+        Some(normalized)
     }
 }
 
@@ -945,6 +1005,7 @@ fn draw_handle_save(state: &mut State, path: Option<&PathBuf>) -> bool {
             return false;
         }
     }
+
     // Redundant with the `draw_file_picker()` caller, but crucial for `draw()`.
     state.wants_file_picker = StateFilePicker::None;
     true
