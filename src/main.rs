@@ -851,7 +851,7 @@ fn draw_file_picker(ctx: &mut Context, state: &mut State) {
 fn draw_dialog_saveas_update_path(state: &mut State) -> Option<PathBuf> {
     let path = state.file_picker_pending_dir.as_path();
     let path = path.join(&state.file_picker_pending_name);
-    let path = match path.canonicalize() {
+    let path = match sys::canonicalize(path) {
         Ok(path) => path,
         Err(err) => {
             error_log_add(state, err.into());

@@ -1,10 +1,11 @@
 use crate::helpers::{CoordType, Size};
 use crate::{apperr, helpers};
-use std::ffi::CStr;
+use std::ffi::{CStr, OsString};
 use std::fmt::Write as _;
-use std::fs::File;
+use std::fs::{self, File};
 use std::mem::MaybeUninit;
 use std::os::windows::io::FromRawHandle;
+use std::path::{Path, PathBuf};
 use std::ptr::{null, null_mut};
 use std::{mem, time};
 use windows_sys::Win32::Foundation;
@@ -392,6 +393,24 @@ pub fn open_stdin_if_redirected() -> Option<File> {
             _ => None,
         }
     }
+}
+
+pub fn canonicalize<P: AsRef<Path>>(path: P) -> apperr::Result<PathBuf> {
+    let mut path = fs::canonicalize(path)?;
+    let path = path.as_mut_os_string();
+    let mut path = mem::take(path).into_encoded_bytes();
+
+    if path.len() > 6
+        && &path[0..4] == br"\\?\"
+        && (b'A'..b'Z').contains(&path[4])
+        && path[5] == b':'
+    {
+        path.drain(0..4);
+    }
+
+    let path = unsafe { OsString::from_encoded_bytes_unchecked(path) };
+    let path = PathBuf::from(path);
+    Ok(path)
 }
 
 pub unsafe fn virtual_reserve(size: usize) -> apperr::Result<*mut u8> {
