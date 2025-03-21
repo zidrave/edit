@@ -755,6 +755,7 @@ fn draw_file_picker(ctx: &mut Context, state: &mut State) {
             height: 0,
         });
         ctx.attr_padding(Rect::two(1, 1));
+        ctx.inherit_focus();
         {
             ctx.table_next_row();
 
@@ -770,13 +771,14 @@ fn draw_file_picker(ctx: &mut Context, state: &mut State) {
             );
 
             ctx.table_next_row();
+            ctx.inherit_focus();
+
             ctx.label(
                 "name-label",
                 Overflow::Clip,
                 &loc(LocId::SaveAsDialogNameLabel),
             );
             ctx.editline("name", &mut state.file_picker_pending_name);
-            ctx.focus_on_first_present();
             ctx.inherit_focus();
             if ctx.is_focused() && ctx.consume_shortcut(vk::RETURN) {
                 activated = true;

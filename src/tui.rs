@@ -284,6 +284,7 @@ impl Tui {
             input_consumed,
 
             tree: Tree::new(),
+            last_modal: null(),
             next_block_id_mixin: 0,
             needs_settling: false,
         }
@@ -298,6 +299,12 @@ impl Tui {
                 .unwrap_or(null())
                 .is_null()
         );
+
+        if let Some(node) = Tree::node_ref(ctx.last_modal) {
+            if !self.is_subtree_focused(node.id) {
+                ctx.steal_focus_for(node);
+            }
+        }
 
         // If nodes have appeared or disappeared, we need to re-render.
         // Same, if the focus has changed (= changes the highlight color, etc.).
@@ -417,8 +424,8 @@ impl Tui {
         // If the focus has changed, the new node may need to be re-rendered.
         // Same, every time we encounter a previously unknown node via `get_prev_node`,
         // because that means it likely failed to get crucial information such as the layout size.
-        debug_assert!(self.settling_have < 100);
-        self.settling_want = (self.settling_have + 1).min(100);
+        debug_assert!(self.settling_have < 20);
+        self.settling_want = (self.settling_have + 1).min(20);
     }
 
     /// Renders all nodes into a string-frame representation.
@@ -986,6 +993,7 @@ pub struct Context<'tui, 'input> {
     input_consumed: bool,
 
     tree: Tree,
+    last_modal: *const Node,
     next_block_id_mixin: u64,
     needs_settling: bool,
 }
@@ -1013,6 +1021,12 @@ impl Context<'_, '_> {
 
     pub fn get_clipboard(&self) -> &[u8] {
         &self.tui.clipboard
+    }
+
+    fn set_needs_settling(&mut self) {
+        // If this hits, the call stack is responsible is trying to deadlock you.
+        debug_assert!(self.tui.settling_have < 100);
+        self.needs_settling = true;
     }
 
     /// Begins a new UI block (container) with a unique ID.
@@ -1071,7 +1085,7 @@ impl Context<'_, '_> {
     fn steal_focus_for(&mut self, node: &Node) {
         if !self.tui.is_node_focused(node.id) {
             Tui::build_node_path(Some(node), &mut self.tui.focused_node_path);
-            self.needs_settling = true;
+            self.set_needs_settling();
         }
     }
 
@@ -1083,7 +1097,7 @@ impl Context<'_, '_> {
             && self.tui.is_node_focused(current_node.id)
         {
             self.tui.pop_focusable_node(1);
-            self.needs_settling = true;
+            self.set_needs_settling();
         }
     }
 
@@ -1100,7 +1114,7 @@ impl Context<'_, '_> {
         parent.attributes.focusable = true;
 
         if self.tui.is_node_focused(parent.id) {
-            self.needs_settling = true;
+            self.set_needs_settling();
             self.tui.focused_node_path.insert(0, last_node.id);
         }
     }
@@ -1227,19 +1241,11 @@ impl Context<'_, '_> {
 
         let last_node = self.tree.last_node_mut();
         last_node.content = NodeContent::Modal(format!(" {} ", title));
+        self.last_modal = last_node;
     }
 
     pub fn modal_end(&mut self) -> bool {
         self.block_end();
-
-        if !self.contains_focus() {
-            helpers::vec_replace_all_reuse(
-                &mut self.tui.focused_node_path,
-                &self.tui.focused_node_path_previous_frame,
-            );
-            self.needs_settling = true;
-        }
-
         self.consume_shortcut(vk::ESCAPE)
     }
 
@@ -2196,7 +2202,7 @@ impl Context<'_, '_> {
         if self.contains_focus() {
             if self.consume_shortcut(vk::ESCAPE) {
                 // TODO: This should reassign the previous focused path.
-                self.needs_settling = true;
+                self.set_needs_settling();
                 self.tui.focused_node_path.clear();
                 self.tui.focused_node_path.push(ROOT_ID);
                 return false;
@@ -2235,7 +2241,7 @@ impl Context<'_, '_> {
 
         if clicked {
             // TODO: This should reassign the previous focused path.
-            self.needs_settling = true;
+            self.set_needs_settling();
             self.tui.focused_node_path.clear();
             self.tui.focused_node_path.push(ROOT_ID);
         }
@@ -2302,7 +2308,7 @@ impl Context<'_, '_> {
             .unwrap();
 
         Tui::build_node_path(Some(focused_node), &mut self.tui.focused_node_path);
-        self.needs_settling = true;
+        self.set_needs_settling();
 
         self.set_input_consumed();
     }
