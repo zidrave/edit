@@ -376,6 +376,15 @@ pub fn vec_insert_at<T: Copy>(dst: &mut Vec<T>, off: usize, src: &[T]) {
     }
 }
 
+// How many functions do you want stuck in unstable? Oh all of them? Okay.
+pub fn string_from_utf8_lossy_owned(v: Vec<u8>) -> String {
+    if let Cow::Owned(string) = String::from_utf8_lossy(&v) {
+        string
+    } else {
+        unsafe { String::from_utf8_unchecked(v) }
+    }
+}
+
 pub fn vec_replace_all_reuse<T: Clone>(dst: &mut Vec<T>, src: &[T]) {
     dst.clear();
     dst.extend_from_slice(src);

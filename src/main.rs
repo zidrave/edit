@@ -433,6 +433,14 @@ fn draw_menu_help(ctx: &mut Context, state: &mut State) {
 
 fn draw_search(ctx: &mut Context, state: &mut State) {
     let mut search_next;
+    let focus = matches!(state.wants_search, StateSearch::Visible { focus: true });
+
+    if focus {
+        let selection = state.buffer.extract_selection(false);
+        let selection = helpers::string_from_utf8_lossy_owned(selection);
+        state.search_needle = selection;
+        state.wants_search = StateSearch::Visible { focus: false };
+    }
 
     ctx.block_begin("search");
     ctx.attr_focus_well();
@@ -457,8 +465,7 @@ fn draw_search(ctx: &mut Context, state: &mut State) {
                 width: COORD_TYPE_SAFE_MAX,
                 height: 1,
             });
-            if matches!(state.wants_search, StateSearch::Visible { focus: true }) {
-                state.wants_search = StateSearch::Visible { focus: false };
+            if focus {
                 ctx.steal_focus();
             }
             search_next |= ctx.is_focused() && ctx.consume_shortcut(vk::RETURN);

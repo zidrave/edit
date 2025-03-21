@@ -450,7 +450,16 @@ impl TextBuffer {
     pub fn copy_from_str(&mut self, text: &str) {
         if self.buffer.copy_from_str(text) {
             self.recalc_after_content_swap();
-            self.cursor_move_to_logical(Point::MAX);
+            self.cursor_move_to_logical(Point {
+                x: CoordType::MAX,
+                y: 0,
+            });
+
+            let delete = self.buffer.len() - self.cursor.offset;
+            if delete != 0 {
+                self.buffer.allocate_gap(self.cursor.offset, 0, delete);
+                self.buffer.commit_gap(0);
+            }
         }
     }
 
