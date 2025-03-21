@@ -1673,32 +1673,28 @@ impl Context<'_, '_> {
 
                     content.scroll_offset.y += height;
                 }
-                vk::END => {
-                    if modifiers == kbmod::SHIFT {
-                        tb.selection_update_logical(Point {
-                            x: CoordType::MAX,
-                            y: tb.get_cursor_logical_pos().y,
-                        });
-                    } else {
-                        tb.cursor_move_to_logical(Point {
-                            x: CoordType::MAX,
-                            y: tb.get_cursor_logical_pos().y,
-                        });
-                    }
-                }
-                vk::HOME => {
-                    if modifiers == kbmod::SHIFT {
-                        tb.selection_update_logical(Point {
-                            x: 0,
-                            y: tb.get_cursor_logical_pos().y,
-                        });
-                    } else {
-                        tb.cursor_move_to_logical(Point {
-                            x: 0,
-                            y: tb.get_cursor_logical_pos().y,
-                        });
-                    }
-                }
+                vk::END => match modifiers {
+                    kbmod::CTRL => tb.cursor_move_to_logical(Point::MAX),
+                    kbmod::SHIFT => tb.selection_update_visual(Point {
+                        x: CoordType::MAX,
+                        y: tb.get_cursor_visual_pos().y,
+                    }),
+                    _ => tb.cursor_move_to_visual(Point {
+                        x: CoordType::MAX,
+                        y: tb.get_cursor_visual_pos().y,
+                    }),
+                },
+                vk::HOME => match modifiers {
+                    kbmod::CTRL => tb.cursor_move_to_logical(Point::default()),
+                    kbmod::SHIFT => tb.selection_update_visual(Point {
+                        x: 0,
+                        y: tb.get_cursor_visual_pos().y,
+                    }),
+                    _ => tb.cursor_move_to_visual(Point {
+                        x: 0,
+                        y: tb.get_cursor_visual_pos().y,
+                    }),
+                },
                 vk::LEFT => {
                     let granularity = if modifiers.contains(kbmod::CTRL) {
                         CursorMovement::Word
