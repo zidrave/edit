@@ -2089,35 +2089,36 @@ impl Context<'_, '_> {
         let item = self.tree.last_node_ref();
         let item_id = item.id;
         let selected_before = content.selected == item_id;
-
-        // Clicking an item activates it
-        let clicked = !self.input_consumed
-            && (self.input_mouse_gesture == InputMouseGesture::DoubleClick && self.is_hovering());
-        // Pressing Enter on a selected item activates it as well
-        let entered = selected_before
-            && !self.input_consumed
-            && matches!(self.input_keyboard, Some(vk::RETURN));
-        let activated = clicked || entered;
-        if activated {
-            self.set_input_consumed();
-        }
+        let focused = self.is_focused();
 
         // Inherit the default selection & Click changes selection
-        let selected_now =
-            selected_before || (select && content.selected == 0) || self.is_focused();
+        let selected_now = selected_before || (select && content.selected == 0) || focused;
 
         // Note down the selected node for keyboard navigation.
         if selected_now {
             content.selected_node = item;
             if !selected_before {
                 content.selected = item_id;
-                self.needs_settling = true;
+                self.set_needs_settling();
             }
         }
 
         self.styled_label_add_text("  ");
         self.styled_label_add_text(text);
         self.styled_label_end();
+
+        // Clicking an item activates it
+        let clicked = !self.input_consumed
+            && (self.input_mouse_gesture == InputMouseGesture::DoubleClick && self.is_hovering());
+        // Pressing Enter on a selected item activates it as well
+        let entered = focused
+            && selected_before
+            && !self.input_consumed
+            && matches!(self.input_keyboard, Some(vk::RETURN));
+        let activated = clicked || entered;
+        if activated {
+            self.set_input_consumed();
+        }
 
         if selected_before && activated {
             ListSelection::Activated
