@@ -1,4 +1,5 @@
 use core::time;
+use std::mem;
 
 use crate::memchr::memchr2;
 
@@ -88,7 +89,15 @@ pub struct Stream<'parser, 'input> {
     off: usize,
 }
 
-impl Stream<'_, '_> {
+impl<'parser, 'input> Stream<'parser, 'input> {
+    pub fn offset(&self) -> usize {
+        self.off
+    }
+
+    pub fn slice(&self, beg: usize, end: usize) -> &'input str {
+        &self.input[beg..end]
+    }
+
     /// Reads and consumes raw bytes from the input.
     pub fn read(&mut self, dst: &mut [u8]) -> usize {
         let bytes = self.input.as_bytes();
@@ -102,8 +111,10 @@ impl Stream<'_, '_> {
     /// Parses the next VT sequence from the previously given input.
     ///
     /// Can't implement Iterator, because this is a "lending iterator".
-    pub fn next(&mut self) -> Option<Token> {
-        let parser = &mut *self.parser;
+    pub fn next(&mut self) -> Option<Token<'parser, 'input>> {
+        // I don't know how to tell Rust that `self.parser` and its lifetime
+        // `'parser` outlives `self`, and at this point I don't care.
+        let parser = unsafe { mem::transmute::<_, &'parser mut Parser>(&mut *self.parser) };
         let input = self.input;
         let bytes = input.as_bytes();
 
@@ -210,7 +221,7 @@ impl Stream<'_, '_> {
                                 if parser.csi.param_count != 0 || parser.csi.params[0] != 0 {
                                     parser.csi.param_count += 1;
                                 }
-                                return Some(Token::Csi(&parser.csi));
+                                return Some(Token::Csi(&parser.csi as &'parser Csi));
                             }
                             b';' => parser.csi.param_count += 1,
                             b'<'..=b'?' => parser.csi.private_byte = c as char,

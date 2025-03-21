@@ -1574,7 +1574,7 @@ impl Context<'_, '_> {
                 text = ucd::strip_newline(&text[..end]);
             }
 
-            tb.write(text);
+            tb.write(text, input.bracketed);
 
             content.preferred_column = tb.get_cursor_visual_pos().x;
             self.set_input_consumed();
@@ -1600,14 +1600,14 @@ impl Context<'_, '_> {
                         // If this is just a simple input field, don't consume Tab (= early return).
                         return false;
                     }
-                    tb.write(b"\t");
+                    tb.write(b"\t", false);
                 }
                 vk::RETURN => {
                     if single_line {
                         // If this is just a simple input field, don't consume Enter (= early return).
                         return false;
                     }
-                    tb.write(b"\n");
+                    tb.write(b"\n", false);
                 }
                 vk::ESCAPE => {
                     // If there was a selection, clear it and show the cursor (= fallthrough).
@@ -1798,7 +1798,7 @@ impl Context<'_, '_> {
                     _ => return false,
                 },
                 vk::INSERT => match modifiers {
-                    kbmod::SHIFT => tb.write(&self.tui.clipboard),
+                    kbmod::SHIFT => tb.write(&self.tui.clipboard, true),
                     kbmod::CTRL => self.tui.clipboard = tb.extract_selection(false),
                     _ => tb.set_overtype(!tb.is_overtype()),
                 },
@@ -1820,7 +1820,7 @@ impl Context<'_, '_> {
                     _ => return false,
                 },
                 vk::V => match modifiers {
-                    kbmod::CTRL => tb.write(&self.tui.clipboard),
+                    kbmod::CTRL => tb.write(&self.tui.clipboard, true),
                     _ => return false,
                 },
                 vk::Y => match modifiers {

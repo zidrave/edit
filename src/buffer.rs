@@ -1519,7 +1519,7 @@ impl TextBuffer {
     ///
     /// If there's a current selection, it will be replaced.
     /// The selection is cleared after the call.
-    pub fn write(&mut self, text: &[u8]) {
+    pub fn write(&mut self, text: &[u8], raw: bool) {
         if text.is_empty() {
             return;
         }
@@ -1557,7 +1557,7 @@ impl TextBuffer {
             while line_off < line.len() {
                 // Split the line into chunks of non-tabs and tabs.
                 let mut plain = line;
-                if !self.indent_with_tabs {
+                if !raw && !self.indent_with_tabs {
                     let end = memchr2(b'\t', b'\t', line, line_off);
                     plain = &line[line_off..end];
                 }
@@ -1575,7 +1575,7 @@ impl TextBuffer {
                 }
             }
 
-            if self.overtype {
+            if !raw && self.overtype {
                 let delete = self.cursor.logical_pos.x - column_before;
                 let end = self.cursor_move_to_logical_internal(
                     self.cursor,
@@ -1592,17 +1592,21 @@ impl TextBuffer {
                 break;
             }
 
-            // We'll give the next line the same indentation as the previous one.
-            // This block figures out how much that is. We can't reuse that value,
-            // because "  a\n  a\n" should give the 3rd line a total indentation of 4.
-            // Assuming your terminal has bracketed paste, this won't be a concern though.
-            // (If it doesn't, use a different terminal.)
-            let tab_size = self.tab_size as usize;
-            let mut newline_indentation = 0usize;
-            {
+            // First, write the newline.
+            newline_buffer.clear();
+            newline_buffer.push_str(if self.newlines_are_crlf { "\r\n" } else { "\n" });
+
+            if !raw {
+                // We'll give the next line the same indentation as the previous one.
+                // This block figures out how much that is. We can't reuse that value,
+                // because "  a\n  a\n" should give the 3rd line a total indentation of 4.
+                // Assuming your terminal has bracketed paste, this won't be a concern though.
+                // (If it doesn't, use a different terminal.)
+                let tab_size = self.tab_size as usize;
                 let line_beg = self.goto_line_start(self.cursor, self.cursor.logical_pos.y);
                 let limit = self.cursor.offset;
                 let mut off = line_beg.offset;
+                let mut newline_indentation = 0usize;
 
                 'outer: while off < limit {
                     let chunk = self.read_forward(off);
@@ -1620,22 +1624,18 @@ impl TextBuffer {
 
                     off += chunk.len();
                 }
+
+                // If tabs are enabled, add as many tabs as we can.
+                if self.indent_with_tabs {
+                    let tab_count = newline_indentation / tab_size;
+                    helpers::string_append_repeat(&mut newline_buffer, '\t', tab_count);
+                    newline_indentation -= tab_count * tab_size;
+                }
+
+                // If tabs are disabled, or if the indentation wasn't a multiple of the tab size,
+                // add spaces to make up the difference.
+                helpers::string_append_repeat(&mut newline_buffer, ' ', newline_indentation);
             }
-
-            // First, write the newline.
-            newline_buffer.clear();
-            newline_buffer.push_str(if self.newlines_are_crlf { "\r\n" } else { "\n" });
-
-            // If tabs are enabled, add as many tabs as we can.
-            if self.indent_with_tabs {
-                let tab_count = newline_indentation / tab_size;
-                helpers::string_append_repeat(&mut newline_buffer, '\t', tab_count);
-                newline_indentation -= tab_count * tab_size;
-            }
-
-            // If tabs are disabled, or if the indentation wasn't a multiple of the tab size,
-            // add spaces to make up the difference.
-            helpers::string_append_repeat(&mut newline_buffer, ' ', newline_indentation);
 
             self.edit_write(newline_buffer.as_bytes());
 

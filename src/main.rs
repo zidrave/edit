@@ -62,16 +62,6 @@ mod ucd_gen;
 mod utf8;
 mod vt;
 
-struct RestoreModes;
-
-impl Drop for RestoreModes {
-    fn drop(&mut self) {
-        // Same as in the beginning but in the reverse order.
-        // It also includes DECSCUSR 0 to reset the cursor style and DECTCEM to show the cursor.
-        sys::write_stdout("\x1b[?1002;1006;2004l\x1b[?1049l\x1b[0 q\x1b[?25h");
-    }
-}
-
 #[derive(Clone, Copy)]
 enum StateSearch {
     Hidden,
@@ -219,16 +209,8 @@ fn run() -> apperr::Result<()> {
         }
     }
 
+    let _restore_modes = set_modes();
     query_color_palette(&mut tui, &mut vt_parser);
-
-    // 1049: Alternative Screen Buffer
-    //   I put the ASB switch in the beginning, just in case the terminal performs
-    //   some additional state tracking beyond the modes we enable/disable.
-    // 1002: Cell Motion Mouse Tracking
-    // 1006: SGR Mouse Mode
-    // 2004: Bracketed Paste Mode
-    let _restore_modes = RestoreModes;
-    sys::write_stdout("\x1b[?1049h\x1b[?1002;1006;2004h");
     sys::inject_window_size_into_stdin();
 
     loop {
@@ -403,7 +385,7 @@ fn draw_menu_edit(ctx: &mut Context, state: &mut State) {
         ctx.set_clipboard(state.buffer.extract_selection(false));
     }
     if ctx.menubar_menu_item(loc(LocId::EditPaste), 'P', kbmod::CTRL | vk::V) {
-        state.buffer.write(ctx.get_clipboard());
+        state.buffer.write(ctx.get_clipboard(), true);
     }
     if !matches!(state.wants_search, StateSearch::Disabled)
         && ctx.menubar_menu_item(loc(LocId::EditFind), 'F', kbmod::CTRL | vk::F)
@@ -1098,6 +1080,27 @@ fn error_log_add(state: &mut State, err: apperr::Error) {
 
 fn file_open(path: &Path) -> apperr::Result<File> {
     File::open(path).map_err(apperr::Error::from)
+}
+
+fn set_modes() -> RestoreModes {
+    // 1049: Alternative Screen Buffer
+    //   I put the ASB switch in the beginning, just in case the terminal performs
+    //   some additional state tracking beyond the modes we enable/disable.
+    // 1002: Cell Motion Mouse Tracking
+    // 1006: SGR Mouse Mode
+    // 2004: Bracketed Paste Mode
+    sys::write_stdout("\x1b[?1049h\x1b[?1002;1006;2004h");
+    RestoreModes
+}
+
+struct RestoreModes;
+
+impl Drop for RestoreModes {
+    fn drop(&mut self) {
+        // Same as in the beginning but in the reverse order.
+        // It also includes DECSCUSR 0 to reset the cursor style and DECTCEM to show the cursor.
+        sys::write_stdout("\x1b[?1002;1006;2004l\x1b[?1049l\x1b[0 q\x1b[?25h");
+    }
 }
 
 fn query_color_palette(tui: &mut Tui, vt_parser: &mut vt::Parser) {

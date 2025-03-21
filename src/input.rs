@@ -239,17 +239,19 @@ pub enum Input<'input> {
 }
 
 pub struct Parser {
-    want: bool,
-    buf: [u8; 3],
-    len: usize,
+    bracketed_paste: bool,
+    x10_mouse_want: bool,
+    x10_mouse_buf: [u8; 3],
+    x10_mouse_len: usize,
 }
 
 impl Parser {
     pub fn new() -> Self {
         Self {
-            want: false,
-            buf: [0; 3],
-            len: 0,
+            bracketed_paste: false,
+            x10_mouse_want: false,
+            x10_mouse_buf: [0; 3],
+            x10_mouse_len: 0,
         }
     }
 
@@ -270,185 +272,216 @@ pub struct Stream<'parser, 'vt, 'input> {
     stream: vt::Stream<'vt, 'input>,
 }
 
-impl Stream<'_, '_, '_> {
+impl<'parser, 'vt, 'input> Stream<'parser, 'vt, 'input> {
     /// Parses the next input action from the previously given input.
     ///
     /// Can't implement Iterator, because this is a "lending iterator".
-    pub fn next(&mut self) -> Option<Input> {
-        if self.parser.want {
-            return self.parse_x10_mouse_coordinates();
-        }
+    pub fn next(&mut self) -> Option<Input<'input>> {
+        loop {
+            if self.parser.bracketed_paste {
+                return self.handle_bracketed_paste();
+            }
 
-        let token = self.stream.next()?;
+            if self.parser.x10_mouse_want {
+                return self.parse_x10_mouse_coordinates();
+            }
 
-        match token {
-            vt::Token::Text(text) => Some(Input::Text(InputText {
-                text,
-                bracketed: false,
-            })),
-            vt::Token::Ctrl(ch) => match ch {
-                '\0' | '\t' | '\r' => Some(Input::Keyboard(InputKey::new(ch as u32))),
-                ..='\x1a' => {
-                    // Shift control code to A-Z
-                    let key = ch as u32 | 0x40;
-                    Some(Input::Keyboard(kbmod::CTRL | InputKey::new(key)))
+            match self.stream.next()? {
+                vt::Token::Text(text) => {
+                    return Some(Input::Text(InputText {
+                        text,
+                        bracketed: false,
+                    }));
                 }
-                '\x7f' => Some(Input::Keyboard(vk::BACK)),
-                _ => None,
-            },
-            vt::Token::Esc(ch) => {
-                match ch {
-                    '\0' => Some(Input::Keyboard(vk::ESCAPE)),
-                    ' '..='~' => {
-                        let ch = ch as u32;
-                        let key = ch & !0x20; // Shift a-z to A-Z
-                        let modifiers = if (ch & 0x20) != 0 {
-                            kbmod::ALT
-                        } else {
-                            kbmod::ALT_SHIFT
-                        };
-                        Some(Input::Keyboard(modifiers | InputKey::new(key)))
+                vt::Token::Ctrl(ch) => match ch {
+                    '\0' | '\t' | '\r' => return Some(Input::Keyboard(InputKey::new(ch as u32))),
+                    ..='\x1a' => {
+                        // Shift control code to A-Z
+                        let key = ch as u32 | 0x40;
+                        return Some(Input::Keyboard(kbmod::CTRL | InputKey::new(key)));
                     }
-                    _ => None,
-                }
-            }
-            vt::Token::SS3(ch) => {
-                if ('P'..='S').contains(&ch) {
-                    let key = vk::F1.value() + ch as u32 - 'P' as u32;
-                    Some(Input::Keyboard(InputKey::new(key)))
-                } else {
-                    None
-                }
-            }
-            vt::Token::Csi(csi) => {
-                match csi.final_byte {
-                    'A'..='H' => {
-                        const LUT: [u8; 8] = [
-                            vk::UP.value() as u8,    // A
-                            vk::DOWN.value() as u8,  // B
-                            vk::RIGHT.value() as u8, // C
-                            vk::LEFT.value() as u8,  // D
-                            0,                       // E
-                            vk::END.value() as u8,   // F
-                            0,                       // G
-                            vk::HOME.value() as u8,  // H
-                        ];
-                        let vk = LUT[csi.final_byte as usize - 'A' as usize];
-                        if vk != 0 {
-                            return Some(Input::Keyboard(
-                                InputKey::new(vk as u32) | Self::parse_modifiers(csi),
-                            ));
+                    '\x7f' => return Some(Input::Keyboard(vk::BACK)),
+                    _ => {}
+                },
+                vt::Token::Esc(ch) => {
+                    match ch {
+                        '\0' => return Some(Input::Keyboard(vk::ESCAPE)),
+                        ' '..='~' => {
+                            let ch = ch as u32;
+                            let key = ch & !0x20; // Shift a-z to A-Z
+                            let modifiers = if (ch & 0x20) != 0 {
+                                kbmod::ALT
+                            } else {
+                                kbmod::ALT_SHIFT
+                            };
+                            return Some(Input::Keyboard(modifiers | InputKey::new(key)));
                         }
-                        None
+                        _ => {}
                     }
-                    'Z' => return Some(Input::Keyboard(kbmod::SHIFT | vk::TAB)),
-                    '~' => {
-                        const LUT: [u8; 35] = [
-                            0,
-                            vk::HOME.value() as u8,   // 1
-                            vk::INSERT.value() as u8, // 2
-                            vk::DELETE.value() as u8, // 3
-                            vk::END.value() as u8,    // 4
-                            vk::PRIOR.value() as u8,  // 5
-                            vk::NEXT.value() as u8,   // 6
-                            0,
-                            0,
-                            0,
-                            0,
-                            0,
-                            0,
-                            0,
-                            0,
-                            vk::F5.value() as u8, // 15
-                            0,
-                            vk::F6.value() as u8,  // 17
-                            vk::F7.value() as u8,  // 18
-                            vk::F8.value() as u8,  // 19
-                            vk::F9.value() as u8,  // 20
-                            vk::F10.value() as u8, // 21
-                            0,
-                            vk::F11.value() as u8, // 23
-                            vk::F12.value() as u8, // 24
-                            vk::F13.value() as u8, // 25
-                            vk::F14.value() as u8, // 26
-                            0,
-                            vk::F15.value() as u8, // 28
-                            vk::F16.value() as u8, // 29
-                            0,
-                            vk::F17.value() as u8, // 31
-                            vk::F18.value() as u8, // 32
-                            vk::F19.value() as u8, // 33
-                            vk::F20.value() as u8, // 34
-                        ];
-                        let p0 = csi.params[0];
-                        if p0 >= 0 && p0 <= LUT.len() as i32 {
-                            let vk = LUT[p0 as usize];
+                }
+                vt::Token::SS3(ch) => {
+                    if ('P'..='S').contains(&ch) {
+                        let key = vk::F1.value() + ch as u32 - 'P' as u32;
+                        return Some(Input::Keyboard(InputKey::new(key)));
+                    }
+                }
+                vt::Token::Csi(csi) => {
+                    match csi.final_byte {
+                        'A'..='H' => {
+                            const LUT: [u8; 8] = [
+                                vk::UP.value() as u8,    // A
+                                vk::DOWN.value() as u8,  // B
+                                vk::RIGHT.value() as u8, // C
+                                vk::LEFT.value() as u8,  // D
+                                0,                       // E
+                                vk::END.value() as u8,   // F
+                                0,                       // G
+                                vk::HOME.value() as u8,  // H
+                            ];
+                            let vk = LUT[csi.final_byte as usize - 'A' as usize];
                             if vk != 0 {
                                 return Some(Input::Keyboard(
                                     InputKey::new(vk as u32) | Self::parse_modifiers(csi),
                                 ));
                             }
                         }
-                        None
-                    }
-                    'm' | 'M' if csi.private_byte == '<' => {
-                        let btn = csi.params[0];
-                        let mut mouse = InputMouse {
-                            state: InputMouseState::None,
-                            modifiers: kbmod::NONE,
-                            position: Point::default(),
-                            scroll: Point::default(),
-                        };
-
-                        mouse.state = InputMouseState::None;
-                        if (btn & 0x40) != 0 {
-                            mouse.state = InputMouseState::Scroll;
-                            mouse.scroll.y += if (btn & 0x01) != 0 { 3 } else { -3 };
-                        } else if csi.final_byte == 'M' {
-                            const STATES: [InputMouseState; 4] = [
-                                InputMouseState::Left,
-                                InputMouseState::Middle,
-                                InputMouseState::Right,
-                                InputMouseState::None,
+                        'Z' => return Some(Input::Keyboard(kbmod::SHIFT | vk::TAB)),
+                        '~' => {
+                            const LUT: [u8; 35] = [
+                                0,
+                                vk::HOME.value() as u8,   // 1
+                                vk::INSERT.value() as u8, // 2
+                                vk::DELETE.value() as u8, // 3
+                                vk::END.value() as u8,    // 4
+                                vk::PRIOR.value() as u8,  // 5
+                                vk::NEXT.value() as u8,   // 6
+                                0,
+                                0,
+                                0,
+                                0,
+                                0,
+                                0,
+                                0,
+                                0,
+                                vk::F5.value() as u8, // 15
+                                0,
+                                vk::F6.value() as u8,  // 17
+                                vk::F7.value() as u8,  // 18
+                                vk::F8.value() as u8,  // 19
+                                vk::F9.value() as u8,  // 20
+                                vk::F10.value() as u8, // 21
+                                0,
+                                vk::F11.value() as u8, // 23
+                                vk::F12.value() as u8, // 24
+                                vk::F13.value() as u8, // 25
+                                vk::F14.value() as u8, // 26
+                                0,
+                                vk::F15.value() as u8, // 28
+                                vk::F16.value() as u8, // 29
+                                0,
+                                vk::F17.value() as u8, // 31
+                                vk::F18.value() as u8, // 32
+                                vk::F19.value() as u8, // 33
+                                vk::F20.value() as u8, // 34
                             ];
-                            mouse.state = STATES[(btn as usize) & 0x03];
+                            const LUT_LEN: i32 = LUT.len() as i32;
+
+                            match csi.params[0] {
+                                0..LUT_LEN => {
+                                    let vk = LUT[csi.params[0] as usize];
+                                    if vk != 0 {
+                                        return Some(Input::Keyboard(
+                                            InputKey::new(vk as u32) | Self::parse_modifiers(csi),
+                                        ));
+                                    }
+                                }
+                                200 => self.parser.bracketed_paste = true,
+                                _ => {}
+                            }
                         }
+                        'm' | 'M' if csi.private_byte == '<' => {
+                            let btn = csi.params[0];
+                            let mut mouse = InputMouse {
+                                state: InputMouseState::None,
+                                modifiers: kbmod::NONE,
+                                position: Point::default(),
+                                scroll: Point::default(),
+                            };
 
-                        mouse.modifiers = kbmod::NONE;
-                        mouse.modifiers |= if (btn & 0x04) != 0 {
-                            kbmod::SHIFT
-                        } else {
-                            kbmod::NONE
-                        };
-                        mouse.modifiers |= if (btn & 0x08) != 0 {
-                            kbmod::ALT
-                        } else {
-                            kbmod::NONE
-                        };
-                        mouse.modifiers |= if (btn & 0x10f) != 0 {
-                            kbmod::CTRL
-                        } else {
-                            kbmod::NONE
-                        };
+                            mouse.state = InputMouseState::None;
+                            if (btn & 0x40) != 0 {
+                                mouse.state = InputMouseState::Scroll;
+                                mouse.scroll.y += if (btn & 0x01) != 0 { 3 } else { -3 };
+                            } else if csi.final_byte == 'M' {
+                                const STATES: [InputMouseState; 4] = [
+                                    InputMouseState::Left,
+                                    InputMouseState::Middle,
+                                    InputMouseState::Right,
+                                    InputMouseState::None,
+                                ];
+                                mouse.state = STATES[(btn as usize) & 0x03];
+                            }
 
-                        mouse.position.x = csi.params[1] - 1;
-                        mouse.position.y = csi.params[2] - 1;
-                        Some(Input::Mouse(mouse))
+                            mouse.modifiers = kbmod::NONE;
+                            mouse.modifiers |= if (btn & 0x04) != 0 {
+                                kbmod::SHIFT
+                            } else {
+                                kbmod::NONE
+                            };
+                            mouse.modifiers |= if (btn & 0x08) != 0 {
+                                kbmod::ALT
+                            } else {
+                                kbmod::NONE
+                            };
+                            mouse.modifiers |= if (btn & 0x10f) != 0 {
+                                kbmod::CTRL
+                            } else {
+                                kbmod::NONE
+                            };
+
+                            mouse.position.x = csi.params[1] - 1;
+                            mouse.position.y = csi.params[2] - 1;
+                            return Some(Input::Mouse(mouse));
+                        }
+                        'M' if csi.param_count == 0 => {
+                            self.parser.x10_mouse_want = true;
+                        }
+                        't' if csi.params[0] == 8 => {
+                            // Window Size
+                            let width = csi.params[2].clamp(1, 32767);
+                            let height = csi.params[1].clamp(1, 32767);
+                            return Some(Input::Resize(Size { width, height }));
+                        }
+                        _ => {}
                     }
-                    'M' if csi.param_count == 0 => {
-                        self.parser.want = true;
-                        None
-                    }
-                    't' if csi.params[0] == 8 => {
-                        // Window Size
-                        let width = csi.params[2].clamp(1, 32767);
-                        let height = csi.params[1].clamp(1, 32767);
-                        Some(Input::Resize(Size { width, height }))
-                    }
-                    _ => None,
+                }
+                _ => {}
+            }
+        }
+    }
+
+    #[cold]
+    fn handle_bracketed_paste(&mut self) -> Option<Input<'input>> {
+        let beg = self.stream.offset();
+        let mut end = beg;
+
+        while let Some(token) = self.stream.next() {
+            if let vt::Token::Csi(csi) = token {
+                if csi.final_byte == '~' && csi.params[0] == 201 {
+                    self.parser.bracketed_paste = false;
+                    break;
                 }
             }
-            _ => None,
+            end = self.stream.offset();
+        }
+
+        if end != beg {
+            Some(Input::Text(InputText {
+                text: self.stream.slice(beg, end),
+                bracketed: true,
+            }))
+        } else {
+            None
         }
     }
 
@@ -460,16 +493,18 @@ impl Stream<'_, '_, '_> {
     /// the end of the sequence. Limited coordinate range and complicated parsing!
     /// This is so puzzling to me. The existence of this function makes me unhappy.
     #[cold]
-    fn parse_x10_mouse_coordinates(&mut self) -> Option<Input> {
-        self.parser.len += self.stream.read(&mut self.parser.buf[self.parser.len..]);
-        if self.parser.len < 3 {
+    fn parse_x10_mouse_coordinates(&mut self) -> Option<Input<'input>> {
+        self.parser.x10_mouse_len += self
+            .stream
+            .read(&mut self.parser.x10_mouse_buf[self.parser.x10_mouse_len..]);
+        if self.parser.x10_mouse_len < 3 {
             return None;
         }
 
-        let button = self.parser.buf[0] & 0b11;
-        let modifier = self.parser.buf[0] & 0b11100;
-        let x = self.parser.buf[1] as i32 - 0x21;
-        let y = self.parser.buf[2] as i32 - 0x21;
+        let button = self.parser.x10_mouse_buf[0] & 0b11;
+        let modifier = self.parser.x10_mouse_buf[0] & 0b11100;
+        let x = self.parser.x10_mouse_buf[1] as i32 - 0x21;
+        let y = self.parser.x10_mouse_buf[2] as i32 - 0x21;
         let action = match button {
             0 => InputMouseState::Left,
             1 => InputMouseState::Middle,
@@ -483,8 +518,8 @@ impl Stream<'_, '_, '_> {
             _ => kbmod::NONE,
         };
 
-        self.parser.want = false;
-        self.parser.len = 0;
+        self.parser.x10_mouse_want = false;
+        self.parser.x10_mouse_len = 0;
 
         Some(Input::Mouse(InputMouse {
             state: action,
