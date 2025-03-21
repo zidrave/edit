@@ -429,7 +429,10 @@ pub fn word_backward(doc: &dyn Document, offset: usize) -> usize {
 
 /// Word navigation implementation. Matches the behavior of VS Code.
 fn word_navigation<T: WordNavigation>(mut nav: T) -> usize {
-    // First skip one newline, if any.
+    // First, fill `self.chunk` with at least 1 grapheme.
+    nav.read();
+
+    // Skip one newline, if any.
     nav.skip_newline();
 
     // Skip any whitespace.
@@ -456,6 +459,7 @@ fn word_navigation<T: WordNavigation>(mut nav: T) -> usize {
 }
 
 trait WordNavigation {
+    fn read(&mut self);
     fn skip_newline(&mut self);
     fn skip_class(&mut self, class: CharClass);
     fn peek(&self, default: CharClass) -> CharClass;
@@ -471,6 +475,11 @@ struct WordForward<'a> {
 }
 
 impl WordNavigation for WordForward<'_> {
+    fn read(&mut self) {
+        self.chunk = self.doc.read_forward(self.offset);
+        self.chunk_off = 0;
+    }
+
     fn skip_newline(&mut self) {
         // We can rely on the fact that the document does not split graphemes across chunks.
         // = If there's a newline it's wholly contained in this chunk.
@@ -483,10 +492,10 @@ impl WordNavigation for WordForward<'_> {
     }
 
     fn skip_class(&mut self, class: CharClass) {
-        'outer: loop {
+        while !self.chunk.is_empty() {
             while self.chunk_off < self.chunk.len() {
                 if WORD_CLASSIFIER[self.chunk[self.chunk_off] as usize] != class {
-                    break 'outer;
+                    return;
                 }
                 self.chunk_off += 1;
             }
@@ -522,6 +531,11 @@ struct WordBackward<'a> {
 }
 
 impl WordNavigation for WordBackward<'_> {
+    fn read(&mut self) {
+        self.chunk = self.doc.read_backward(self.offset);
+        self.chunk_off = self.chunk.len();
+    }
+
     fn skip_newline(&mut self) {
         // We can rely on the fact that the document does not split graphemes across chunks.
         // = If there's a newline it's wholly contained in this chunk.
@@ -534,10 +548,10 @@ impl WordNavigation for WordBackward<'_> {
     }
 
     fn skip_class(&mut self, class: CharClass) {
-        'outer: loop {
+        while !self.chunk.is_empty() {
             while self.chunk_off > 0 {
                 if WORD_CLASSIFIER[self.chunk[self.chunk_off - 1] as usize] != class {
-                    break 'outer;
+                    return;
                 }
                 self.chunk_off -= 1;
             }
