@@ -59,8 +59,7 @@ impl TextBufferSelection {
 
 #[derive(Copy, Clone, Eq, PartialEq)]
 enum HistoryType {
-    None,
-    CursorMovement,
+    Other,
     Write,
     Delete,
 }
@@ -178,7 +177,7 @@ impl TextBuffer {
 
             undo_stack: LinkedList::new(),
             redo_stack: LinkedList::new(),
-            last_history_type: HistoryType::None,
+            last_history_type: HistoryType::Other,
             last_save_generation: 0,
 
             active_edit_line_info: None,
@@ -476,7 +475,7 @@ impl TextBuffer {
         // If the buffer was changed, nothing we previously saved can be relied upon.
         self.undo_stack.clear();
         self.redo_stack.clear();
-        self.last_history_type = HistoryType::None;
+        self.last_history_type = HistoryType::Other;
         self.cursor = ucd::UcdCursor::default();
         self.cursor_for_rendering = None;
         self.selection = TextBufferSelection::None;
@@ -1215,13 +1214,13 @@ impl TextBuffer {
 
     fn set_cursor(&mut self, cursor: ucd::UcdCursor) {
         self.set_cursor_internal(cursor);
-        self.last_history_type = HistoryType::CursorMovement;
+        self.last_history_type = HistoryType::Other;
         self.selection = TextBufferSelection::None;
     }
 
     fn set_cursor_for_selection(&mut self, cursor: ucd::UcdCursor) {
         self.set_cursor_internal(cursor);
-        self.last_history_type = HistoryType::CursorMovement;
+        self.last_history_type = HistoryType::Other;
     }
 
     fn set_cursor_internal(&mut self, cursor: ucd::UcdCursor) {
@@ -1240,8 +1239,11 @@ impl TextBuffer {
 
     fn extract_raw(&self, mut beg: usize, mut end: usize, out: &mut Vec<u8>, mut out_off: usize) {
         debug_assert!(beg <= end && end <= self.text_length());
+
         end = end.min(self.text_length());
         beg = beg.min(end);
+        out_off = out_off.min(out.len());
+
         if beg >= end {
             return;
         }
@@ -1654,8 +1656,8 @@ impl TextBuffer {
     pub fn delete(&mut self, granularity: CursorMovement, delta: CoordType) {
         debug_assert!(delta == -1 || delta == 1);
 
-        let beg;
-        let end;
+        let mut beg;
+        let mut end;
 
         if self.selection.is_some() {
             (beg, end) = match self.extract_selection_range() {
@@ -1675,6 +1677,9 @@ impl TextBuffer {
             end = self.cursor_move_delta_internal(beg, granularity, delta);
             if beg.offset == end.offset {
                 return;
+            }
+            if beg.offset > end.offset {
+                mem::swap(&mut beg, &mut end);
             }
         }
 
@@ -1741,10 +1746,9 @@ impl TextBuffer {
         let cursor_before = self.cursor;
         self.set_cursor_internal(cursor);
 
-        // If both the last and this are a Write operation, we skip allocating a new undo history item.
-        if !(self.last_history_type == HistoryType::Write && history_type == HistoryType::Write)
-            && !(self.last_history_type == HistoryType::Delete
-                && history_type == HistoryType::Delete)
+        // If both the last and this are a Write/Delete operation, we skip allocating a new undo history item.
+        if history_type != self.last_history_type
+            || !matches!(history_type, HistoryType::Write | HistoryType::Delete)
         {
             self.redo_stack.clear();
             while self.undo_stack.len() > 1000 {
@@ -1752,7 +1756,6 @@ impl TextBuffer {
             }
 
             self.last_history_type = history_type;
-            self.active_edit_off = cursor.offset;
             self.undo_stack.push_back(HistoryEntry {
                 cursor_before: cursor_before.logical_pos,
                 selection_before: self.selection,
@@ -1764,23 +1767,25 @@ impl TextBuffer {
             });
         }
 
+        self.active_edit_off = cursor.offset;
+
         // If word-wrap is enabled, the visual layout of all logical lines affected by the write
         // may have changed. This includes even text before the insertion point up to the line
         // start, because this write may have joined with a word before the initial cursor.
         // See other uses of `word_wrap_cursor_next_line` in this function.
         if self.word_wrap_column != CoordType::MAX {
-            let safe_start = self.goto_line_start(cursor_before, cursor_before.logical_pos.y);
+            let safe_start = self.goto_line_start(cursor, cursor.logical_pos.y);
             let next_line = self.cursor_move_to_logical_internal(
-                cursor_before,
+                cursor,
                 Point {
                     x: 0,
-                    y: cursor_before.logical_pos.y + 1,
+                    y: cursor.logical_pos.y + 1,
                 },
             );
             self.active_edit_line_info = Some(ActiveEditLineInfo {
                 safe_start,
                 line_height_in_rows: next_line.visual_pos.y - safe_start.visual_pos.y,
-                distance_next_line_start: next_line.offset - cursor_before.offset,
+                distance_next_line_start: next_line.offset - cursor.offset,
             });
         }
     }
@@ -1811,33 +1816,27 @@ impl TextBuffer {
     }
 
     fn edit_delete(&mut self, to: ucd::UcdCursor) {
+        debug_assert!(to.offset >= self.active_edit_off);
+
+        let undo = trust_me_bro::this_lifetime_change_is_totally_safe_mut(self.get_last_undo_mut());
         let logical_y_before = self.cursor.logical_pos.y;
-        let backward = to.offset < self.active_edit_off;
-        let [beg, end] = helpers::minmax(self.active_edit_off, to.offset);
+        let off = self.active_edit_off;
+        let mut out_off = usize::MAX;
+
+        if self.cursor.logical_pos < undo.cursor {
+            out_off = 0; // Prepend the deleted portion.
+            undo.cursor = self.cursor.logical_pos; // Note the start of the deleted portion.
+        }
 
         // Copy the deleted portion into the undo entry.
-        {
-            let undo = self.get_last_undo_mut();
-            let deleted = trust_me_bro::this_lifetime_change_is_totally_safe_mut(&mut undo.deleted);
-            self.extract_raw(beg, end, deleted, if backward { 0 } else { deleted.len() });
-        }
+        let deleted = &mut undo.deleted;
+        self.extract_raw(off, to.offset, deleted, out_off);
 
         // Delete the portion from the buffer by enlarging the gap.
-        {
-            let count = end - beg;
-            self.buffer.allocate_gap(beg, 0, count);
-            self.buffer.commit_gap(0);
-        }
+        let count = to.offset - off;
+        self.buffer.allocate_gap(off, 0, count);
+        self.buffer.commit_gap(0);
 
-        // Move self.cursor to the beginning of the deleted text.
-        // This is only relevant for backward deletions.
-        if backward {
-            let undo = self.get_last_undo_mut();
-            undo.cursor = to.logical_pos;
-            self.cursor = to;
-        }
-
-        self.active_edit_off = beg;
         self.stats.logical_lines += logical_y_before - to.logical_pos.y;
     }
 
@@ -1851,7 +1850,17 @@ impl TextBuffer {
         #[cfg(debug_assertions)]
         {
             let entry = self.get_last_undo_mut();
-            debug_assert!(!entry.deleted.is_empty() || !entry.added.is_empty());
+            if entry.deleted.is_empty() && entry.added.is_empty() {
+                // This should never occur _if_ the calling code was written correctly.
+                debug_assert!(false);
+
+                self.undo_stack.pop_back();
+                if self.undo_stack.is_empty() {
+                    self.last_history_type = HistoryType::Other;
+                }
+
+                return;
+            }
         }
 
         if let Some(info) = self.active_edit_line_info.take() {
@@ -1970,7 +1979,7 @@ impl TextBuffer {
         self.set_cursor_internal(cursor_before);
 
         if self.undo_stack.is_empty() {
-            self.last_history_type = HistoryType::None;
+            self.last_history_type = HistoryType::Other;
         }
     }
 
