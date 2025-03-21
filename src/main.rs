@@ -986,6 +986,7 @@ fn draw_handle_wants_exit(ctx: &mut Context, state: &mut State) {
             if ctx.button("yes", Overflow::Clip, loc(LocId::UnsavedChangesDialogYes)) {
                 state.wants_save = StateSave::Save;
             }
+            ctx.focus_on_first_present();
             if ctx.button("no", Overflow::Clip, loc(LocId::UnsavedChangesDialogNo)) {
                 state.exit = true;
             }
@@ -996,7 +997,13 @@ fn draw_handle_wants_exit(ctx: &mut Context, state: &mut State) {
             ) {
                 state.wants_exit = false;
             }
-            ctx.focus_on_first_present();
+
+            // TODO: This should highlight the corresponding letter in the label.
+            if ctx.consume_shortcut(vk::S) {
+                state.wants_save = StateSave::Save;
+            } else if ctx.consume_shortcut(vk::N) {
+                state.exit = true;
+            }
         }
         ctx.table_end();
     }
