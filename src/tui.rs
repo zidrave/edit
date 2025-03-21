@@ -139,6 +139,7 @@ impl Tui {
         // Same for Scroll events.
         if self.mouse_state > InputMouseState::Right {
             self.mouse_state = InputMouseState::None;
+            self.mouse_gesture = InputMouseGesture::None;
             self.mouse_down_position = Point::MIN;
         }
 
