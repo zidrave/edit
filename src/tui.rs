@@ -61,6 +61,7 @@ pub struct Tui {
     mouse_gesture: InputMouseGesture,
     last_click: std::time::Instant,
     last_click_target: u64,
+    last_click_position: Point,
 
     clipboard: Vec<u8>,
     cached_text_buffers: Vec<CachedTextBuffer>,
@@ -94,6 +95,7 @@ impl Tui {
             mouse_gesture: InputMouseGesture::None,
             last_click: std::time::Instant::now(),
             last_click_target: 0,
+            last_click_position: Point::MIN,
 
             clipboard: Vec::new(),
             cached_text_buffers: Vec::with_capacity(16),
@@ -233,7 +235,8 @@ impl Tui {
                     // TODO: This should check if the last action was a Click as well (and not keyboard input).
                     let click_target = unsafe { focused_node.as_ref() }.map(|n| n.id).unwrap_or(0);
                     let action = if (now - self.last_click) <= std::time::Duration::from_millis(500)
-                        && self.last_click_target == click_target
+                        && click_target == self.last_click_target
+                        && next_position == self.last_click_position
                     {
                         InputMouseGesture::DoubleClick
                     } else {
@@ -241,6 +244,7 @@ impl Tui {
                     };
                     self.last_click = now;
                     self.last_click_target = click_target;
+                    self.last_click_position = next_position;
                     action
                 } else if self.mouse_state == InputMouseState::Left
                     && next_state == InputMouseState::Left
