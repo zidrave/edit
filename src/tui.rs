@@ -1540,6 +1540,12 @@ impl Context<'_, '_> {
             let mut make_cursor_visible = false;
             let mouse = self.tui.mouse_position;
             let inner = node_prev.inner;
+            let text = Rect {
+                left: inner.left + tb.get_margin_width(),
+                top: inner.top,
+                right: inner.right - 1,
+                bottom: inner.bottom,
+            };
             let pos = Point {
                 x: mouse.x - inner.left - tb.get_margin_width() + tc.scroll_offset.x,
                 y: mouse.y - inner.top + tc.scroll_offset.y,
@@ -1574,30 +1580,38 @@ impl Context<'_, '_> {
                     } else {
                         tb.selection_update_visual(pos);
 
-                        // If the editor is only 1 line tall we can't possibly scroll up or down.
                         let height = inner.height();
+
+                        // If the editor is only 1 line tall we can't possibly scroll up or down.
                         if height >= 2 {
-                            // Otherwise, the scroll zone is up to 3 lines at the top/bottom.
-                            let zone_height = (height / 2).min(3);
+                            fn calc(min: CoordType, max: CoordType, mouse: CoordType) -> CoordType {
+                                // Otherwise, the scroll zone is up to 3 lines at the top/bottom.
+                                let zone_height = ((max - min) / 2).min(3);
 
-                            // The .y positions where the scroll zones begin:
-                            // Mouse coordinates above top and below bottom respectively.
-                            let scroll_top = inner.top + zone_height;
-                            let scroll_bottom = inner.bottom - zone_height - 1;
+                                // The .y positions where the scroll zones begin:
+                                // Mouse coordinates above top and below bottom respectively.
+                                let scroll_min = min + zone_height;
+                                let scroll_max = max - zone_height - 1;
 
-                            // Calculate the delta for scrolling up or down.
-                            let delta_top = (mouse.y - scroll_top).clamp(-zone_height, 0);
-                            let delta_bottom = (mouse.y - scroll_bottom).clamp(0, zone_height);
+                                // Calculate the delta for scrolling up or down.
+                                let delta_min = (mouse - scroll_min).clamp(-zone_height, 0);
+                                let delta_max = (mouse - scroll_max).clamp(0, zone_height);
 
-                            // If I didn't mess up my logic here, only one of the two values can possibly be !=0.
-                            // This allows us to easily combine them with BitOr.
+                                // If I didn't mess up my logic here, only one of the two values can possibly be !=0.
+                                let idx = 3 + delta_min + delta_max;
 
-                            let idx = 3 + delta_top + delta_bottom;
-
-                            if idx != 3 {
                                 const SPEEDS: [CoordType; 7] = [-9, -3, -1, 0, 1, 3, 9];
                                 let idx = idx.clamp(0, SPEEDS.len() as CoordType) as usize;
-                                tc.scroll_offset.y += SPEEDS[idx];
+                                SPEEDS[idx]
+                            }
+
+                            let delta_x = calc(text.left, text.right, mouse.x);
+                            let delta_y = calc(text.top, text.bottom, mouse.y);
+
+                            tc.scroll_offset.x += delta_x;
+                            tc.scroll_offset.y += delta_y;
+
+                            if delta_x != 0 || delta_y != 0 {
                                 self.tui.read_timeout = time::Duration::from_millis(25);
                             }
                         }
