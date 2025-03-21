@@ -132,9 +132,9 @@ static mut STATE: State = State {
 /// Returns `None` if there was an error reading from stdin.
 /// Returns `Some("")` if the given timeout was reached.
 /// Otherwise, it returns the read, non-empty string.
-pub fn read_stdin(timeout: Option<time::Duration>) -> Option<String> {
+pub fn read_stdin(timeout: time::Duration) -> Option<String> {
     unsafe {
-        if let Some(timeout) = timeout {
+        if timeout != time::Duration::MAX {
             let mut pollfd = libc::pollfd {
                 fd: STATE.stdin,
                 events: libc::POLLIN,

@@ -1,5 +1,5 @@
-use core::time;
 use std::mem;
+use std::time;
 
 use crate::memchr::memchr2;
 
@@ -57,13 +57,13 @@ impl Parser {
     /// We need this because of the ambiguouity of whether a trailing
     /// escape character in an input is starting another escape sequence or
     /// is just the result of the user literally pressing the Escape key.
-    pub fn read_timeout(&mut self) -> Option<std::time::Duration> {
+    pub fn read_timeout(&mut self) -> std::time::Duration {
         match self.state {
             // 100ms is a upper ceiling for a responsive feel. This uses half that,
             // under the assumption that a really slow terminal needs equal amounts
             // of time for I and O. Realistically though, this could be much lower.
-            State::Esc => Some(time::Duration::from_millis(50)),
-            _ => None,
+            State::Esc => time::Duration::from_millis(50),
+            _ => time::Duration::MAX,
         }
     }
 
@@ -90,12 +90,12 @@ pub struct Stream<'parser, 'input> {
 }
 
 impl<'parser, 'input> Stream<'parser, 'input> {
-    pub fn offset(&self) -> usize {
-        self.off
+    pub fn input(&self) -> &'input str {
+        self.input
     }
 
-    pub fn slice(&self, beg: usize, end: usize) -> &'input str {
-        &self.input[beg..end]
+    pub fn offset(&self) -> usize {
+        self.off
     }
 
     /// Reads and consumes raw bytes from the input.

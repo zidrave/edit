@@ -214,7 +214,8 @@ fn run() -> apperr::Result<()> {
     sys::inject_window_size_into_stdin();
 
     loop {
-        let Some(input) = sys::read_stdin(vt_parser.read_timeout()) else {
+        let read_timeout = vt_parser.read_timeout().min(tui.read_timeout());
+        let Some(input) = sys::read_stdin(read_timeout) else {
             break;
         };
 
@@ -228,20 +229,26 @@ fn run() -> apperr::Result<()> {
         let mut input_iter = input_parser.parse(vt_iter);
 
         // Process all input.
-        while let Some(ui_input) = input_iter.next() {
-            let mut ctx = tui.create_context(Some(ui_input));
+        while {
+            let input = input_iter.next();
+            let more = input.is_some();
+            let mut ctx = tui.create_context(input);
+
             draw(&mut ctx, &mut state);
 
             #[cfg(feature = "debug-latency")]
             {
                 passes += 1;
             }
-        }
+
+            more
+        } {}
 
         // Continue rendering until the layout has settled.
         // This can take >1 frame, if the input focus is tossed between different controls.
         while tui.needs_settling() {
             let mut ctx = tui.create_context(None);
+
             draw(&mut ctx, &mut state);
 
             #[cfg(feature = "debug-layout")]

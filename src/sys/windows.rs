@@ -219,14 +219,14 @@ fn get_console_size() -> Option<Size> {
 /// Returns `None` if there was an error reading from stdin.
 /// Returns `Some("")` if the given timeout was reached.
 /// Otherwise, it returns the read, non-empty string.
-pub fn read_stdin(timeout: Option<time::Duration>) -> Option<String> {
+pub fn read_stdin(timeout: time::Duration) -> Option<String> {
     let mut input_buf = [const { MaybeUninit::<Console::INPUT_RECORD>::uninit() }; 1024];
     let mut input_buf_cap = input_buf.len();
     let mut utf16_buf = [const { MaybeUninit::<u16>::uninit() }; 1024];
     let mut utf16_buf_len = 0;
     let mut resize_event = None;
     let mut read_more = true;
-    let mut read_poll = timeout.is_some();
+    let mut read_poll = false;
 
     if unsafe { STATE.inject_resize } {
         resize_event = get_console_size();
@@ -241,7 +241,8 @@ pub fn read_stdin(timeout: Option<time::Duration>) -> Option<String> {
         unsafe { STATE.leading_surrogate = 0 };
     }
 
-    if let Some(timeout) = timeout {
+    if timeout != time::Duration::MAX {
+        read_poll = true;
         let wait_result =
             unsafe { Threading::WaitForSingleObject(STATE.stdin, timeout.as_millis() as u32) };
         match wait_result {

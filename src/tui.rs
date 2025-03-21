@@ -8,6 +8,7 @@ use std::fmt::Write as _;
 use std::iter;
 use std::mem;
 use std::ptr::{self, null};
+use std::time;
 
 const ROOT_ID: u64 = 0x14057B7EF767814F; // Knuth's MMIX constant
 const SHIFT_TAB: InputKey = vk::TAB.with_modifiers(kbmod::SHIFT);
@@ -46,6 +47,7 @@ struct CachedTextBuffer {
 
 pub struct Tui {
     framebuffer: Framebuffer,
+    read_timeout: time::Duration,
 
     /// Last known terminal size.
     size: Size,
@@ -56,6 +58,7 @@ pub struct Tui {
     mouse_down_position: Point,
     /// Last known mouse state.
     mouse_state: InputMouseState,
+    mouse_gesture: InputMouseGesture,
     last_click: std::time::Instant,
     last_click_target: u64,
 
@@ -79,6 +82,7 @@ impl Tui {
     pub fn new() -> Self {
         let mut tui = Self {
             framebuffer: Framebuffer::new(),
+            read_timeout: time::Duration::MAX,
 
             size: Size {
                 width: 0,
@@ -87,6 +91,7 @@ impl Tui {
             mouse_position: Point::MIN,
             mouse_down_position: Point::MIN,
             mouse_state: InputMouseState::None,
+            mouse_gesture: InputMouseGesture::None,
             last_click: std::time::Instant::now(),
             last_click_target: 0,
 
@@ -121,6 +126,10 @@ impl Tui {
         self.framebuffer.set_indexed_colors(colors);
     }
 
+    pub fn read_timeout(&mut self) -> time::Duration {
+        mem::replace(&mut self.read_timeout, time::Duration::MAX)
+    }
+
     pub fn create_context<'tui, 'input>(
         &'tui mut self,
         input: Option<input::Input<'input>>,
@@ -143,17 +152,14 @@ impl Tui {
         }
 
         let now = std::time::Instant::now();
-        let mut input_consumed = false;
         let mut input_text = None;
         let mut input_keyboard = None;
         let mut input_mouse_modifiers = kbmod::NONE;
-        let mut input_mouse_gesture = InputMouseGesture::None;
+        let mut input_mouse_gesture = self.mouse_gesture;
         let mut input_scroll_delta = Point { x: 0, y: 0 };
 
         match input {
-            None => {
-                input_consumed = true;
-            }
+            None => {}
             Some(input::Input::Resize(resize)) => {
                 assert!(resize.width > 0 && resize.height > 0);
                 assert!(resize.width < 32768 && resize.height < 32768);
@@ -253,6 +259,7 @@ impl Tui {
                 input_scroll_delta = next_scroll;
                 self.mouse_position = next_position;
                 self.mouse_state = next_state;
+                self.mouse_gesture = next_gesture;
             }
         }
 
@@ -271,7 +278,7 @@ impl Tui {
             input_mouse_modifiers,
             input_mouse_gesture,
             input_scroll_delta,
-            input_consumed,
+            input_consumed: false,
 
             tree: Tree::new(),
             next_block_id_mixin: 0,
@@ -1401,7 +1408,11 @@ impl Context<'_, '_> {
         }
     }
 
-    pub fn editline<'a, 'b: 'a>(&'a mut self, classname: &'static str, text: &'b mut String) {
+    pub fn editline<'a, 'b: 'a>(
+        &'a mut self,
+        classname: &'static str,
+        text: &'b mut String,
+    ) -> bool {
         self.block_begin(classname);
 
         let node = self.tree.current_node_mut();
@@ -1428,11 +1439,13 @@ impl Context<'_, '_> {
 
         self.textarea_internal(buffer.clone(), true);
 
-        if buffer.is_dirty() {
+        let changed = buffer.is_dirty();
+        if changed {
             buffer.save_as_string(text);
         }
 
         self.block_end();
+        changed
     }
 
     pub fn textarea(&mut self, classname: &'static str, tb: RcTextBuffer) {
@@ -1510,10 +1523,11 @@ impl Context<'_, '_> {
 
         if self.tui.mouse_state != InputMouseState::None && self.tui.is_node_focused(node_prev.id) {
             let mut make_cursor_visible = false;
+            let mouse = self.tui.mouse_position;
+            let inner = node_prev.inner;
             let pos = Point {
-                x: self.tui.mouse_position.x - node_prev.inner.left - tb.get_margin_width()
-                    + content.scroll_offset.x,
-                y: self.tui.mouse_position.y - node_prev.inner.top + content.scroll_offset.y,
+                x: mouse.x - inner.left - tb.get_margin_width() + content.scroll_offset.x,
+                y: mouse.y - inner.top + content.scroll_offset.y,
             };
 
             match self.input_mouse_gesture {
@@ -1522,10 +1536,10 @@ impl Context<'_, '_> {
                 }
                 InputMouseGesture::Drag(delta) => {
                     let track_rect = Rect {
-                        left: node_prev.inner.right - 1,
-                        top: node_prev.inner.top,
-                        right: node_prev.inner.right,
-                        bottom: node_prev.inner.bottom,
+                        left: inner.right - 1,
+                        top: inner.top,
+                        right: inner.right,
+                        bottom: inner.bottom,
                     };
                     if track_rect.contains(self.tui.mouse_down_position) {
                         let track_height = track_rect.height();
@@ -1533,10 +1547,39 @@ impl Context<'_, '_> {
                             // The textarea supports 1 height worth of "scrolling beyond the end".
                             // `track_height` is the same as the viewport height.
                             let content_height = tb.get_visual_line_count() + track_height;
-                            content.scroll_offset.y += delta.y * content_height / track_height;
+                            content.scroll_offset.y +=
+                                delta.y * (content_height + track_height) / track_height;
                         }
                     } else {
                         tb.selection_update_visual(pos);
+
+                        // If the editor is only 1 line tall we can't possibly scroll up or down.
+                        let height = inner.height();
+                        if height >= 2 {
+                            // Otherwise, the scroll zone is up to 3 lines at the top/bottom.
+                            let zone_height = (height / 2).min(3);
+
+                            // The .y positions where the scroll zones begin:
+                            // Mouse coordinates above top and below bottom respectively.
+                            let scroll_top = inner.top + zone_height;
+                            let scroll_bottom = inner.bottom - zone_height - 1;
+
+                            // Calculate the delta for scrolling up or down.
+                            let delta_top = (mouse.y - scroll_top).clamp(-zone_height, 0);
+                            let delta_bottom = (mouse.y - scroll_bottom).clamp(0, zone_height);
+
+                            // If I didn't mess up my logic here, only one of the two values can possibly be !=0.
+                            // This allows us to easily combine them with BitOr.
+
+                            let idx = 3 + delta_top + delta_bottom;
+
+                            if idx != 3 {
+                                const SPEEDS: [CoordType; 7] = [-9, -3, -1, 0, 1, 3, 9];
+                                let idx = idx.clamp(0, SPEEDS.len() as CoordType) as usize;
+                                content.scroll_offset.y += SPEEDS[idx];
+                                self.tui.read_timeout = time::Duration::from_millis(25);
+                            }
+                        }
                     }
                 }
                 _ => {

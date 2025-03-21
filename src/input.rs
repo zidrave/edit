@@ -476,8 +476,9 @@ impl<'parser, 'vt, 'input> Stream<'parser, 'vt, 'input> {
         }
 
         if end != beg {
+            let input = self.stream.input();
             Some(Input::Text(InputText {
-                text: self.stream.slice(beg, end),
+                text: &input[beg..end],
                 bracketed: true,
             }))
         } else {
