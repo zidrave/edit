@@ -876,9 +876,21 @@ impl TextBuffer {
 
     pub fn find_and_select(&mut self, pattern: &str, options: SearchOptions) -> apperr::Result<()> {
         if let Some(search) = &mut self.search {
+            // When the search input changes we must reset the search.
             if search.pattern != pattern || search.options != options {
                 self.search = None;
             }
+
+            // When transitioning from some search to no search, we must clear the selection.
+            if pattern.is_empty() {
+                if let TextBufferSelection::Done { beg, .. } = self.selection {
+                    self.cursor_move_to_logical(beg);
+                }
+            }
+        }
+
+        if pattern.is_empty() {
+            return Ok(());
         }
 
         if self.search.is_none() {

@@ -440,7 +440,7 @@ fn draw_search(ctx: &mut Context, state: &mut State) {
 
             ctx.label("label", Overflow::Clip, loc(LocId::SearchLabel));
 
-            ctx.editline("input", &mut state.search_needle);
+            search_next = ctx.editline("input", &mut state.search_needle);
             ctx.attr_intrinsic_size(Size {
                 width: COORD_TYPE_SAFE_MAX,
                 height: 1,
@@ -449,7 +449,7 @@ fn draw_search(ctx: &mut Context, state: &mut State) {
                 state.wants_search = StateSearch::Visible { focus: false };
                 ctx.steal_focus();
             }
-            search_next = ctx.is_focused() && ctx.consume_shortcut(vk::RETURN);
+            search_next |= ctx.is_focused() && ctx.consume_shortcut(vk::RETURN);
         }
         ctx.table_end();
 
@@ -493,7 +493,7 @@ fn draw_search(ctx: &mut Context, state: &mut State) {
     }
     ctx.block_end();
 
-    if search_next && !state.search_needle.is_empty() {
+    if search_next {
         if let Err(err) = state
             .buffer
             .find_and_select(&state.search_needle, state.search_options)
