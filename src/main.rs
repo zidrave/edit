@@ -70,8 +70,9 @@ enum StateSearch {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum StateSave {
+enum StateFilePicker {
     None,
+    Open,
     Save,
     SaveAs,
 }
@@ -93,10 +94,10 @@ struct State {
     error_log_index: usize,
     error_log_count: usize,
 
-    wants_save: StateSave,
-    save_pending_dir: DisplayablePathBuf,
-    save_pending_name: String, // This could be PathBuf, if `tui` would expose its TextBuffer for editline.
-    save_entries: Option<Vec<DisplayablePathBuf>>,
+    wants_file_picker: StateFilePicker,
+    file_picker_pending_dir: DisplayablePathBuf,
+    file_picker_pending_name: String, // This could be PathBuf, if `tui` would expose its TextBuffer for editline.
+    file_picker_entries: Option<Vec<DisplayablePathBuf>>,
 
     wants_search: StateSearch,
     search_needle: String,
@@ -140,10 +141,10 @@ impl State {
             error_log_index: 0,
             error_log_count: 0,
 
-            wants_save: StateSave::None,
-            save_pending_dir: DisplayablePathBuf::new(std::env::current_dir()?),
-            save_pending_name: filename,
-            save_entries: None,
+            wants_file_picker: StateFilePicker::None,
+            file_picker_pending_dir: DisplayablePathBuf::new(std::env::current_dir()?),
+            file_picker_pending_name: filename,
+            file_picker_entries: None,
 
             wants_search: StateSearch::Hidden,
             search_needle: String::new(),
@@ -300,13 +301,11 @@ fn draw(ctx: &mut Context, state: &mut State) {
     draw_editor(ctx, state);
     draw_statusbar(ctx, state);
 
-    if state.wants_save != StateSave::None
-        && (state.wants_save == StateSave::SaveAs || state.path.is_none())
-    {
-        draw_dialog_saveas(ctx, state);
+    if state.wants_file_picker != StateFilePicker::None {
+        draw_file_picker(ctx, state);
     }
 
-    if state.wants_save == StateSave::Save {
+    if state.wants_file_picker == StateFilePicker::Save {
         draw_handle_save(state, None);
     }
 
@@ -316,7 +315,7 @@ fn draw(ctx: &mut Context, state: &mut State) {
 
     // If the user presses "Save" on the exit dialog we'll possible show a SaveAs dialog.
     // The exit dialog should then get hidden.
-    if state.wants_exit && state.wants_save == StateSave::None {
+    if state.wants_exit && state.wants_file_picker == StateFilePicker::None {
         draw_handle_wants_exit(ctx, state);
     }
 
@@ -328,12 +327,15 @@ fn draw(ctx: &mut Context, state: &mut State) {
         draw_error_log(ctx, state);
     }
 
-    // Shortcuts that are not handled as part of the textarea.
+    // Shortcuts that are not handled as part of the textarea, etc.
+    if ctx.consume_shortcut(kbmod::CTRL | vk::O) {
+        state.wants_file_picker = StateFilePicker::Open;
+    }
     if ctx.consume_shortcut(kbmod::CTRL | vk::S) {
-        state.wants_save = StateSave::Save;
+        state.wants_file_picker = StateFilePicker::Save;
     }
     if ctx.consume_shortcut(kbmod::CTRL_SHIFT | vk::S) {
-        state.wants_save = StateSave::SaveAs;
+        state.wants_file_picker = StateFilePicker::SaveAs;
     }
     if ctx.consume_shortcut(kbmod::CTRL | vk::Q) {
         state.wants_exit = true;
@@ -366,11 +368,14 @@ fn draw_menubar(ctx: &mut Context, state: &mut State) {
 }
 
 fn draw_menu_file(ctx: &mut Context, state: &mut State) {
+    if ctx.menubar_menu_item(loc(LocId::FileOpen), 'O', kbmod::CTRL | vk::O) {
+        state.wants_file_picker = StateFilePicker::Open;
+    }
     if ctx.menubar_menu_item(loc(LocId::FileSave), 'S', kbmod::CTRL | vk::S) {
-        state.wants_save = StateSave::Save;
+        state.wants_file_picker = StateFilePicker::Save;
     }
     if ctx.menubar_menu_item(loc(LocId::FileSaveAs), 'A', vk::NULL) {
-        state.wants_save = StateSave::SaveAs;
+        state.wants_file_picker = StateFilePicker::SaveAs;
     }
     if ctx.menubar_menu_item(loc(LocId::FileExit), 'X', kbmod::CTRL | vk::Q) {
         state.wants_exit = true;
@@ -715,17 +720,27 @@ fn draw_statusbar(ctx: &mut Context, state: &mut State) {
     ctx.table_end();
 }
 
-fn draw_dialog_saveas(ctx: &mut Context, state: &mut State) {
-    if state.wants_save == StateSave::Save && state.path.is_none() {
-        state.wants_save = StateSave::SaveAs;
+fn draw_file_picker(ctx: &mut Context, state: &mut State) {
+    if state.wants_file_picker == StateFilePicker::Save && !state.path.is_none() {
+        // `draw_handle_save` will handle things.
+        return;
     }
 
     let width = (ctx.size().width - 20).max(10);
     let height = (ctx.size().height - 10).max(10);
 
-    ctx.modal_begin("saveas", loc(LocId::SaveAsDialogTitle));
+    ctx.modal_begin(
+        "file-picker",
+        if state.wants_file_picker == StateFilePicker::Open {
+            loc(LocId::FileOpen)
+        } else {
+            loc(LocId::FileSaveAs)
+        },
+    );
     ctx.attr_intrinsic_size(Size { width, height });
     {
+        let mut activated = false;
+
         ctx.table_begin("path");
         ctx.table_set_columns(&[0, COORD_TYPE_SAFE_MAX]);
         ctx.table_set_cell_gap(Size {
@@ -744,7 +759,7 @@ fn draw_dialog_saveas(ctx: &mut Context, state: &mut State) {
             ctx.label(
                 "dir",
                 Overflow::TruncateMiddle,
-                state.save_pending_dir.as_str(),
+                state.file_picker_pending_dir.as_str(),
             );
 
             ctx.table_next_row();
@@ -753,20 +768,20 @@ fn draw_dialog_saveas(ctx: &mut Context, state: &mut State) {
                 Overflow::Clip,
                 &loc(LocId::SaveAsDialogNameLabel),
             );
-            ctx.editline("name", &mut state.save_pending_name);
+            ctx.editline("name", &mut state.file_picker_pending_name);
             ctx.focus_on_first_present();
             ctx.inherit_focus();
             if ctx.is_focused() && ctx.consume_shortcut(vk::RETURN) {
-                state.wants_save = StateSave::Save;
+                activated = true;
             }
         }
         ctx.table_end();
 
-        if state.save_entries.is_none() {
+        if state.file_picker_entries.is_none() {
             draw_dialog_saveas_refresh_files(state);
         }
 
-        let files = state.save_entries.as_ref().unwrap();
+        let files = state.file_picker_entries.as_ref().unwrap();
 
         ctx.scrollarea_begin(
             "directory",
@@ -779,22 +794,22 @@ fn draw_dialog_saveas(ctx: &mut Context, state: &mut State) {
             },
         );
         ctx.attr_background_rgba(ctx.indexed(IndexedColor::Cyan));
-        ctx.next_block_id_mixin(state.save_pending_dir.as_str().len() as u64);
+        ctx.next_block_id_mixin(state.file_picker_pending_dir.as_str().len() as u64);
         {
             ctx.list_begin("files");
             ctx.inherit_focus();
             for entry in files.iter() {
                 match ctx.list_item(
-                    state.save_pending_name == entry.as_str(),
+                    state.file_picker_pending_name == entry.as_str(),
                     Overflow::TruncateMiddle,
                     entry.as_str(),
                 ) {
                     ListSelection::Unchanged => {}
                     ListSelection::Selected => {
-                        state.save_pending_name = entry.as_str().to_string();
+                        state.file_picker_pending_name = entry.as_str().to_string();
                     }
                     ListSelection::Activated => {
-                        state.wants_save = StateSave::Save;
+                        activated = true;
                     }
                 }
             }
@@ -802,28 +817,33 @@ fn draw_dialog_saveas(ctx: &mut Context, state: &mut State) {
         }
         ctx.scrollarea_end();
 
-        if state.wants_save == StateSave::Save {
+        if activated {
             if let Some(path) = draw_dialog_saveas_update_path(state) {
+                let success = if state.wants_file_picker == StateFilePicker::Open {
+                    draw_handle_load(state, Some(&path), None)
+                } else {
+                    draw_handle_save(state, Some(&path))
+                };
                 // Only update the path if the save was successful.
-                if draw_handle_save(state, Some(&path)) {
+                if success {
                     state.path = Some(path);
-                    state.filename = state.save_pending_name.clone();
-                    state.wants_save = StateSave::None;
+                    state.filename = state.file_picker_pending_name.clone();
+                    state.wants_file_picker = StateFilePicker::None;
                 }
             } else {
-                state.wants_save = StateSave::SaveAs;
+                state.wants_file_picker = StateFilePicker::SaveAs;
             }
         }
     }
     if ctx.modal_end() {
-        state.wants_save = StateSave::None;
+        state.wants_file_picker = StateFilePicker::None;
     }
 }
 
 // Returns Some(path) if the caller should attempt to save the file.
 fn draw_dialog_saveas_update_path(state: &mut State) -> Option<PathBuf> {
-    let path = state.save_pending_dir.as_path();
-    let path = path.join(&state.save_pending_name);
+    let path = state.file_picker_pending_dir.as_path();
+    let path = path.join(&state.file_picker_pending_name);
     let path = match path.canonicalize() {
         Ok(path) => path,
         Err(err) => {
@@ -843,13 +863,13 @@ fn draw_dialog_saveas_update_path(state: &mut State) -> Option<PathBuf> {
             .into_owned();
         (dir, name)
     };
-    if dir != state.save_pending_dir.as_path() {
-        state.save_pending_dir = DisplayablePathBuf::new(dir.to_path_buf());
-        state.save_entries = None;
+    if dir != state.file_picker_pending_dir.as_path() {
+        state.file_picker_pending_dir = DisplayablePathBuf::new(dir.to_path_buf());
+        state.file_picker_entries = None;
     }
 
-    state.save_pending_name = name;
-    if state.save_pending_name.is_empty() {
+    state.file_picker_pending_name = name;
+    if state.file_picker_pending_name.is_empty() {
         None
     } else {
         Some(path)
@@ -857,7 +877,7 @@ fn draw_dialog_saveas_update_path(state: &mut State) -> Option<PathBuf> {
 }
 
 fn draw_dialog_saveas_refresh_files(state: &mut State) {
-    let dir = state.save_pending_dir.as_path();
+    let dir = state.file_picker_pending_dir.as_path();
     let mut files = Vec::new();
 
     if dir.parent().is_some() {
@@ -890,7 +910,23 @@ fn draw_dialog_saveas_refresh_files(state: &mut State) {
         }
     });
 
-    state.save_entries = Some(files);
+    state.file_picker_entries = Some(files);
+}
+
+fn draw_handle_load(
+    state: &mut State,
+    path: Option<&PathBuf>,
+    encoding: Option<&'static str>,
+) -> bool {
+    if let Some(path) = path.or(state.path.as_ref()) {
+        if let Err(err) =
+            file_open(path).and_then(|mut file| state.buffer.read_file(&mut file, encoding))
+        {
+            error_log_add(state, err);
+            return false;
+        }
+    }
+    true
 }
 
 fn draw_handle_save(state: &mut State, path: Option<&PathBuf>) -> bool {
@@ -900,7 +936,8 @@ fn draw_handle_save(state: &mut State, path: Option<&PathBuf>) -> bool {
             return false;
         }
     }
-    state.wants_save = StateSave::None;
+    // Redundant with the `draw_file_picker()` caller, but crucial for `draw()`.
+    state.wants_file_picker = StateFilePicker::None;
     true
 }
 
@@ -936,20 +973,9 @@ fn draw_dialog_encoding_change(ctx: &mut Context, state: &mut State) {
                     state.wants_encoding_change = StateEncodingChange::None;
                     if reopen && state.path.is_some() {
                         if state.buffer.is_dirty() {
-                            if let Some(path) = &state.path {
-                                if let Err(err) = state.buffer.write_file(path) {
-                                    error_log_add(state, err);
-                                }
-                            }
+                            draw_handle_save(state, None);
                         }
-
-                        if let Some(path) = &mut state.path {
-                            if let Err(err) = file_open(path).and_then(|mut file| {
-                                state.buffer.read_file(&mut file, Some(encoding.as_str()))
-                            }) {
-                                error_log_add(state, err);
-                            }
-                        }
+                        draw_handle_load(state, None, Some(encoding.as_str()));
                     } else {
                         state.buffer.set_encoding(encoding.as_str());
                     }
@@ -991,7 +1017,7 @@ fn draw_handle_wants_exit(ctx: &mut Context, state: &mut State) {
             ctx.table_next_row();
 
             if ctx.button("yes", Overflow::Clip, loc(LocId::UnsavedChangesDialogYes)) {
-                state.wants_save = StateSave::Save;
+                state.wants_file_picker = StateFilePicker::Save;
             }
             ctx.focus_on_first_present();
             if ctx.button("no", Overflow::Clip, loc(LocId::UnsavedChangesDialogNo)) {
@@ -1007,7 +1033,7 @@ fn draw_handle_wants_exit(ctx: &mut Context, state: &mut State) {
 
             // TODO: This should highlight the corresponding letter in the label.
             if ctx.consume_shortcut(vk::S) {
-                state.wants_save = StateSave::Save;
+                state.wants_file_picker = StateFilePicker::Save;
             } else if ctx.consume_shortcut(vk::N) {
                 state.exit = true;
             }

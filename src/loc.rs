@@ -8,6 +8,7 @@ pub enum LocId {
 
     // File menu
     File,
+    FileOpen,
     FileSave,
     FileSaveAs,
     FileExit,
@@ -57,7 +58,6 @@ pub enum LocId {
     IndentationTabs,
     IndentationSpaces,
 
-    SaveAsDialogTitle,
     SaveAsDialogPathLabel,
     SaveAsDialogNameLabel,
 
@@ -144,6 +144,20 @@ const S_LANG_LUT: [[&str; LangId::Count as usize]; LocId::Count as usize] = [
         /* zh_hans */ "文件",
         /* zh_hant */ "檔案",
     ],
+    // FileOpen
+    [
+        /* en      */ "Open File…",
+        /* de      */ "Datei öffnen…",
+        /* es      */ "Abrir archivo…",
+        /* fr      */ "Ouvrir un fichier…",
+        /* it      */ "Apri file…",
+        /* ja      */ "ファイルを開く…",
+        /* ko      */ "파일 열기…",
+        /* pt_br   */ "Abrir arquivo…",
+        /* ru      */ "Открыть файл…",
+        /* zh_hans */ "打开文件…",
+        /* zh_hant */ "開啟檔案…",
+    ],
     // FileSave
     [
         /* en      */ "Save",
@@ -159,7 +173,6 @@ const S_LANG_LUT: [[&str; LangId::Count as usize]; LocId::Count as usize] = [
         /* zh_hant */ "儲存",
     ],
     // FileSaveAs
-    // NOTE: Exact same translation as SaveAsDialogTitle, and both should be kept in sync.
     [
         /* en      */ "Save As…",
         /* de      */ "Speichern unter…",
@@ -645,21 +658,6 @@ const S_LANG_LUT: [[&str; LangId::Count as usize]; LocId::Count as usize] = [
         /* zh_hant */ "空格",
     ],
 
-    // SaveAsDialogTitle
-    // NOTE: Exact same translation as FileSaveAs, and both should be kept in sync.
-    [
-        /* en      */ "Save As…",
-        /* de      */ "Speichern unter…",
-        /* es      */ "Guardar como…",
-        /* fr      */ "Enregistrer sous…",
-        /* it      */ "Salva come…",
-        /* ja      */ "名前を付けて保存…",
-        /* ko      */ "다른 이름으로 저장…",
-        /* pt_br   */ "Salvar como…",
-        /* ru      */ "Сохранить как…",
-        /* zh_hans */ "另存为…",
-        /* zh_hant */ "另存新檔…",
-    ],
     // SaveAsDialogPathLabel
     [
         /* en      */ "Folder:",
