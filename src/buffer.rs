@@ -1511,6 +1511,15 @@ impl TextBuffer {
             };
             if text.contains(cursor) {
                 fb.set_cursor(cursor, self.overtype);
+                fb.blend_bg(
+                    Rect {
+                        left: destination.left,
+                        top: cursor.y,
+                        right: destination.right,
+                        bottom: cursor.y + 1,
+                    },
+                    0x1f7f7f7f,
+                );
             }
         }
     }
