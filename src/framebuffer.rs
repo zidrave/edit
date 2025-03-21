@@ -205,9 +205,9 @@ impl Framebuffer {
         track: Rect,
         content_offset: CoordType,
         content_height: CoordType,
-    ) {
+    ) -> CoordType {
         if track.is_empty() {
-            return;
+            return 0;
         }
 
         let viewport_height = track.height();
@@ -305,6 +305,8 @@ impl Framebuffer {
             self.blend_bg(rect, self.indexed(IndexedColor::BrightWhite));
             self.blend_fg(rect, self.indexed(IndexedColor::BrightBlack));
         }
+
+        ((thumb_height + 4) / 8) as CoordType
     }
 
     #[inline]

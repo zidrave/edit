@@ -36,7 +36,7 @@ enum InputMouseGesture {
     None,
     Click,
     DoubleClick,
-    Drag(Point),
+    Drag,
 }
 
 struct CachedTextBuffer {
@@ -75,8 +75,8 @@ pub struct Tui {
     prev_node_map_shift: usize,
     prev_node_map_mask: u64,
 
-    settling_have: u32,
-    settling_want: u32,
+    settling_have: i32,
+    settling_want: i32,
 }
 
 impl Tui {
@@ -151,7 +151,7 @@ impl Tui {
         );
 
         if self.scroll_to_focused() {
-            self.needs_settling();
+            self.needs_more_settling();
         }
 
         let now = std::time::Instant::now();
@@ -160,6 +160,7 @@ impl Tui {
         let mut input_mouse_modifiers = kbmod::NONE;
         let mut input_mouse_gesture = self.mouse_gesture;
         let mut input_scroll_delta = Point { x: 0, y: 0 };
+        let input_consumed = self.needs_settling();
 
         match input {
             None => {}
@@ -251,10 +252,7 @@ impl Tui {
                     && next_position != self.mouse_position
                 {
                     // Mouse down and moved = Drag.
-                    InputMouseGesture::Drag(Point {
-                        x: next_position.x - self.mouse_position.x,
-                        y: next_position.y - self.mouse_position.y,
-                    })
+                    InputMouseGesture::Drag
                 } else {
                     InputMouseGesture::None
                 };
@@ -268,7 +266,7 @@ impl Tui {
             }
         }
 
-        if input.is_some() {
+        if !input_consumed {
             // Every time there's input, we naturally need to re-render at least once.
             self.settling_have = 0;
             self.settling_want = 1;
@@ -283,7 +281,7 @@ impl Tui {
             input_mouse_modifiers,
             input_mouse_gesture,
             input_scroll_delta,
-            input_consumed: false,
+            input_consumed,
 
             tree: Tree::new(),
             next_block_id_mixin: 0,
@@ -361,6 +359,8 @@ impl Tui {
             self.needs_more_settling();
         }
 
+        self.settling_have += 1;
+
         // Remove cached text editors that are no longer in use.
         self.cached_text_buffers.retain(|c| c.seen);
 
@@ -410,7 +410,6 @@ impl Tui {
 
     /// After you finished processing all input, continue redrawing your UI until this returns false.
     pub fn needs_settling(&mut self) -> bool {
-        self.settling_have += 1;
         self.settling_have <= self.settling_want
     }
 
@@ -418,7 +417,8 @@ impl Tui {
         // If the focus has changed, the new node may need to be re-rendered.
         // Same, every time we encounter a previously unknown node via `get_prev_node`,
         // because that means it likely failed to get crucial information such as the layout size.
-        self.settling_want = self.settling_have + 1;
+        debug_assert!(self.settling_have < 100);
+        self.settling_want = (self.settling_have + 1).min(100);
     }
 
     /// Renders all nodes into a string-frame representation.
@@ -624,8 +624,8 @@ impl Tui {
                     }
                 }
             }
-            NodeContent::Textarea(content) => {
-                let tb = &mut *content.buffer;
+            NodeContent::Textarea(tc) => {
+                let tb = &mut *tc.buffer;
                 let mut destination = Rect {
                     left: inner_clipped.left,
                     top: inner_clipped.top,
@@ -633,19 +633,19 @@ impl Tui {
                     bottom: inner_clipped.bottom,
                 };
 
-                if !content.single_line {
+                if !tc.single_line {
                     // Account for the scrollbar.
                     destination.right -= 1;
                 }
 
                 tb.render(
-                    content.scroll_offset,
+                    tc.scroll_offset,
                     destination,
-                    content.has_focus,
+                    tc.has_focus,
                     &mut self.framebuffer,
                 );
 
-                if !content.single_line {
+                if !tc.single_line {
                     // Render the scrollbar.
                     let track = Rect {
                         left: inner_clipped.right - 1,
@@ -653,15 +653,15 @@ impl Tui {
                         right: inner_clipped.right,
                         bottom: inner_clipped.bottom,
                     };
-                    self.framebuffer.draw_scrollbar(
+                    tc.thumb_height = self.framebuffer.draw_scrollbar(
                         inner_clipped,
                         track,
-                        content.scroll_offset.y,
+                        tc.scroll_offset.y,
                         tb.get_visual_line_count() + inner.height() - 1,
                     );
                 }
             }
-            NodeContent::Scrollarea(pos) => {
+            NodeContent::Scrollarea(sc) => {
                 let content = Tree::node_ref(node.children.first).unwrap();
                 let track = Rect {
                     left: inner.right,
@@ -669,10 +669,10 @@ impl Tui {
                     right: inner.right + 1,
                     bottom: inner.bottom,
                 };
-                self.framebuffer.draw_scrollbar(
+                sc.thumb_height = self.framebuffer.draw_scrollbar(
                     outer_clipped,
                     track,
-                    pos.y,
+                    sc.scroll_offset.y,
                     content.intrinsic_size.height,
                 );
             }
@@ -955,12 +955,12 @@ impl Tui {
         let mut scroll_to = focused.outer;
 
         while !scrollarea.parent.is_null() && scrollarea.attributes.float.is_none() {
-            if let NodeContent::Scrollarea(off) = &mut scrollarea.content {
-                let off_y = off.y.max(0);
+            if let NodeContent::Scrollarea(sc) = &mut scrollarea.content {
+                let off_y = sc.scroll_offset.y.max(0);
                 let mut y = off_y;
                 y = y.min(scroll_to.top - scrollarea.inner.top + off_y);
                 y = y.max(scroll_to.bottom - scrollarea.inner.bottom + off_y);
-                off.y = y;
+                sc.scroll_offset.y = y;
                 scroll_to = scrollarea.outer;
             }
             scrollarea = Tree::node_mut(scrollarea.parent).unwrap();
@@ -1470,6 +1470,8 @@ impl Context<'_, '_> {
         let mut content = TextareaContent {
             buffer,
             scroll_offset: Point::default(),
+            scroll_offset_y_drag_start: CoordType::MIN,
+            thumb_height: 0,
             preferred_column: 0,
             single_line,
             has_focus: self.tui.is_node_focused(node.id),
@@ -1478,6 +1480,8 @@ impl Context<'_, '_> {
         if let Some(node_prev) = self.tui.get_prev_node(node.id) {
             if let NodeContent::Textarea(content_prev) = &node_prev.content {
                 content.scroll_offset = content_prev.scroll_offset;
+                content.scroll_offset_y_drag_start = content_prev.scroll_offset_y_drag_start;
+                content.thumb_height = content_prev.thumb_height;
                 content.preferred_column = content_prev.preferred_column;
 
                 let mut text_width = node_prev.inner.width();
@@ -1508,7 +1512,7 @@ impl Context<'_, '_> {
 
     fn textarea_handle_input(
         &mut self,
-        content: &mut TextareaContent,
+        tc: &mut TextareaContent,
         node_prev: &Node,
         single_line: bool,
     ) -> bool {
@@ -1516,12 +1520,12 @@ impl Context<'_, '_> {
             return false;
         }
 
-        let tb = &mut *content.buffer;
+        let tb = &mut *tc.buffer;
 
         if self.tui.mouse_state == InputMouseState::Scroll && self.tui.is_node_hovered(node_prev.id)
         {
-            content.scroll_offset.x += self.input_scroll_delta.x;
-            content.scroll_offset.y += self.input_scroll_delta.y;
+            tc.scroll_offset.x += self.input_scroll_delta.x;
+            tc.scroll_offset.y += self.input_scroll_delta.y;
             self.set_input_consumed();
             return false;
         }
@@ -1531,15 +1535,15 @@ impl Context<'_, '_> {
             let mouse = self.tui.mouse_position;
             let inner = node_prev.inner;
             let pos = Point {
-                x: mouse.x - inner.left - tb.get_margin_width() + content.scroll_offset.x,
-                y: mouse.y - inner.top + content.scroll_offset.y,
+                x: mouse.x - inner.left - tb.get_margin_width() + tc.scroll_offset.x,
+                y: mouse.y - inner.top + tc.scroll_offset.y,
             };
 
             match self.input_mouse_gesture {
                 InputMouseGesture::DoubleClick => {
                     tb.select_word();
                 }
-                InputMouseGesture::Drag(delta) => {
+                InputMouseGesture::Drag => {
                     let track_rect = Rect {
                         left: inner.right - 1,
                         top: inner.top,
@@ -1547,13 +1551,19 @@ impl Context<'_, '_> {
                         bottom: inner.bottom,
                     };
                     if track_rect.contains(self.tui.mouse_down_position) {
-                        let track_height = track_rect.height();
-                        if track_height > 0 {
-                            // The textarea supports 1 height worth of "scrolling beyond the end".
-                            // `track_height` is the same as the viewport height.
-                            let content_height = tb.get_visual_line_count() + track_height;
-                            content.scroll_offset.y +=
-                                delta.y * (content_height + track_height) / track_height;
+                        if tc.scroll_offset_y_drag_start == CoordType::MIN {
+                            tc.scroll_offset_y_drag_start = tc.scroll_offset.y;
+                        }
+
+                        // The textarea supports 1 height worth of "scrolling beyond the end".
+                        // `track_height` is the same as the viewport height.
+                        let scrollable_height = tb.get_visual_line_count() - 1;
+
+                        if scrollable_height > 0 {
+                            let trackable = track_rect.height() - tc.thumb_height;
+                            let delta_y = mouse.y - self.tui.mouse_down_position.y;
+                            tc.scroll_offset.y = tc.scroll_offset_y_drag_start
+                                + ((delta_y * scrollable_height) / trackable);
                         }
                     } else {
                         tb.selection_update_visual(pos);
@@ -1581,7 +1591,7 @@ impl Context<'_, '_> {
                             if idx != 3 {
                                 const SPEEDS: [CoordType; 7] = [-9, -3, -1, 0, 1, 3, 9];
                                 let idx = idx.clamp(0, SPEEDS.len() as CoordType) as usize;
-                                content.scroll_offset.y += SPEEDS[idx];
+                                tc.scroll_offset.y += SPEEDS[idx];
                                 self.tui.read_timeout = time::Duration::from_millis(25);
                             }
                         }
@@ -1590,7 +1600,7 @@ impl Context<'_, '_> {
                 _ => {
                     match self.tui.mouse_state {
                         InputMouseState::Left => {
-                            content.preferred_column = tb.get_cursor_visual_pos().x;
+                            tc.preferred_column = tb.get_cursor_visual_pos().x;
                             if self.input_mouse_modifiers.contains(kbmod::SHIFT) {
                                 // TODO: Untested because Windows Terminal surprisingly doesn't support Shift+Click.
                                 tb.selection_update_visual(pos);
@@ -1600,6 +1610,7 @@ impl Context<'_, '_> {
                             make_cursor_visible = true;
                         }
                         InputMouseState::Release => {
+                            tc.scroll_offset_y_drag_start = CoordType::MIN;
                             tb.selection_finalize();
                         }
                         _ => return false,
@@ -1611,7 +1622,7 @@ impl Context<'_, '_> {
             return make_cursor_visible;
         }
 
-        if !content.has_focus {
+        if !tc.has_focus {
             return false;
         }
 
@@ -1624,7 +1635,7 @@ impl Context<'_, '_> {
 
             tb.write(text, input.bracketed);
 
-            content.preferred_column = tb.get_cursor_visual_pos().x;
+            tc.preferred_column = tb.get_cursor_visual_pos().x;
             self.set_input_consumed();
             return true;
         }
@@ -1677,22 +1688,22 @@ impl Context<'_, '_> {
                     // If the cursor was already on the first line,
                     // move it to the start of the buffer.
                     if tb.get_cursor_visual_pos().y == 0 {
-                        content.preferred_column = 0;
+                        tc.preferred_column = 0;
                     }
 
                     if modifiers == kbmod::SHIFT {
                         tb.selection_update_visual(Point {
-                            x: content.preferred_column,
+                            x: tc.preferred_column,
                             y: tb.get_cursor_visual_pos().y - height,
                         });
                     } else {
                         tb.cursor_move_to_visual(Point {
-                            x: content.preferred_column,
+                            x: tc.preferred_column,
                             y: tb.get_cursor_visual_pos().y - height,
                         });
                     }
 
-                    content.scroll_offset.y -= height;
+                    tc.scroll_offset.y -= height;
                 }
                 vk::NEXT => {
                     let height = node_prev.inner.height();
@@ -1700,26 +1711,26 @@ impl Context<'_, '_> {
                     // If the cursor was already on the last line,
                     // move it to the end of the buffer.
                     if tb.get_cursor_visual_pos().y >= tb.get_visual_line_count() - 1 {
-                        content.preferred_column = CoordType::MAX;
+                        tc.preferred_column = CoordType::MAX;
                     }
 
                     if modifiers == kbmod::SHIFT {
                         tb.selection_update_visual(Point {
-                            x: content.preferred_column,
+                            x: tc.preferred_column,
                             y: tb.get_cursor_visual_pos().y + height,
                         });
                     } else {
                         tb.cursor_move_to_visual(Point {
-                            x: content.preferred_column,
+                            x: tc.preferred_column,
                             y: tb.get_cursor_visual_pos().y + height,
                         });
                     }
 
-                    if content.preferred_column == CoordType::MAX {
-                        content.preferred_column = tb.get_cursor_visual_pos().x;
+                    if tc.preferred_column == CoordType::MAX {
+                        tc.preferred_column = tb.get_cursor_visual_pos().x;
                     }
 
-                    content.scroll_offset.y += height;
+                    tc.scroll_offset.y += height;
                 }
                 vk::END => match modifiers {
                     kbmod::CTRL => tb.cursor_move_to_logical(Point::MAX),
@@ -1761,27 +1772,27 @@ impl Context<'_, '_> {
                             // If the cursor was already on the first line,
                             // move it to the start of the buffer.
                             if tb.get_cursor_visual_pos().y == 0 {
-                                content.preferred_column = 0;
+                                tc.preferred_column = 0;
                             }
 
                             tb.cursor_move_to_visual(Point {
-                                x: content.preferred_column,
+                                x: tc.preferred_column,
                                 y: tb.get_cursor_visual_pos().y - 1,
                             });
                         }
                         kbmod::CTRL => {
-                            content.scroll_offset.y -= 1;
+                            tc.scroll_offset.y -= 1;
                             make_cursor_visible = false;
                         }
                         kbmod::SHIFT => {
                             // If the cursor was already on the first line,
                             // move it to the start of the buffer.
                             if tb.get_cursor_visual_pos().y == 0 {
-                                content.preferred_column = 0;
+                                tc.preferred_column = 0;
                             }
 
                             tb.selection_update_visual(Point {
-                                x: content.preferred_column,
+                                x: tc.preferred_column,
                                 y: tb.get_cursor_visual_pos().y - 1,
                             });
                         }
@@ -1808,36 +1819,36 @@ impl Context<'_, '_> {
                         // If the cursor was already on the last line,
                         // move it to the end of the buffer.
                         if tb.get_cursor_visual_pos().y >= tb.get_visual_line_count() - 1 {
-                            content.preferred_column = CoordType::MAX;
+                            tc.preferred_column = CoordType::MAX;
                         }
 
                         tb.cursor_move_to_visual(Point {
-                            x: content.preferred_column,
+                            x: tc.preferred_column,
                             y: tb.get_cursor_visual_pos().y + 1,
                         });
 
-                        if content.preferred_column == CoordType::MAX {
-                            content.preferred_column = tb.get_cursor_visual_pos().x;
+                        if tc.preferred_column == CoordType::MAX {
+                            tc.preferred_column = tb.get_cursor_visual_pos().x;
                         }
                     }
                     kbmod::CTRL => {
-                        content.scroll_offset.y += 1;
+                        tc.scroll_offset.y += 1;
                         make_cursor_visible = false;
                     }
                     kbmod::SHIFT => {
                         // If the cursor was already on the last line,
                         // move it to the end of the buffer.
                         if tb.get_cursor_visual_pos().y >= tb.get_visual_line_count() - 1 {
-                            content.preferred_column = CoordType::MAX;
+                            tc.preferred_column = CoordType::MAX;
                         }
 
                         tb.selection_update_visual(Point {
-                            x: content.preferred_column,
+                            x: tc.preferred_column,
                             y: tb.get_cursor_visual_pos().y + 1,
                         });
 
-                        if content.preferred_column == CoordType::MAX {
-                            content.preferred_column = tb.get_cursor_visual_pos().x;
+                        if tc.preferred_column == CoordType::MAX {
+                            tc.preferred_column = tb.get_cursor_visual_pos().x;
                         }
                     }
                     kbmod::CTRL_ALT => {
@@ -1877,6 +1888,7 @@ impl Context<'_, '_> {
                 },
                 vk::Z => match modifiers {
                     kbmod::CTRL => tb.undo(),
+                    kbmod::CTRL_SHIFT => tb.redo(),
                     kbmod::ALT => tb.toggle_word_wrap(),
                     _ => return false,
                 },
@@ -1884,7 +1896,7 @@ impl Context<'_, '_> {
             }
 
             if !matches!(key, vk::PRIOR | vk::NEXT | vk::UP | vk::DOWN) {
-                content.preferred_column = tb.get_cursor_visual_pos().x;
+                tc.preferred_column = tb.get_cursor_visual_pos().x;
             }
 
             self.set_input_consumed();
@@ -1935,7 +1947,11 @@ impl Context<'_, '_> {
         self.block_begin(classname);
 
         let container = self.tree.last_node_mut();
-        container.content = NodeContent::Scrollarea(Point::MIN);
+        container.content = NodeContent::Scrollarea(ScrollareaContent {
+            scroll_offset: Point::MIN,
+            scroll_offset_y_drag_start: CoordType::MIN,
+            thumb_height: 0,
+        });
 
         if intrinsic_size.width > 0 || intrinsic_size.height > 0 {
             container.intrinsic_size.width = intrinsic_size.width.max(0);
@@ -1952,8 +1968,8 @@ impl Context<'_, '_> {
 
     pub fn scrollarea_scroll_to(&mut self, pos: Point) {
         let container = self.tree.last_node_mut();
-        if let NodeContent::Scrollarea(scrollarea) = &mut container.content {
-            *scrollarea = pos;
+        if let NodeContent::Scrollarea(sc) = &mut container.content {
+            sc.scroll_offset = pos;
         } else {
             debug_assert!(false);
         }
@@ -1963,48 +1979,65 @@ impl Context<'_, '_> {
         self.block_end(); // content block
 
         let container = self.tree.current_node_mut();
-        let NodeContent::Scrollarea(scroll_offset) = &mut container.content else {
+        let NodeContent::Scrollarea(sc) = &mut container.content else {
             panic!();
         };
 
         if let Some(prev_container) = self.tui.get_prev_node(container.id) {
-            if *scroll_offset == Point::MIN {
-                if let NodeContent::Scrollarea(prev_offset) = &prev_container.content {
-                    *scroll_offset = *prev_offset;
+            if sc.scroll_offset == Point::MIN {
+                if let NodeContent::Scrollarea(sc_prev) = &prev_container.content {
+                    *sc = sc_prev.clone();
                 }
             }
 
             if !self.input_consumed && self.tui.mouse_state != InputMouseState::None {
                 let container_rect = prev_container.inner;
 
-                if self.tui.mouse_state == InputMouseState::Scroll {
-                    if container_rect.contains(self.tui.mouse_position) {
-                        scroll_offset.x += self.input_scroll_delta.x;
-                        scroll_offset.y += self.input_scroll_delta.y;
-                        self.set_input_consumed();
-                    }
-                } else if let InputMouseGesture::Drag(delta) = self.input_mouse_gesture {
-                    // We don't need to look up the previous track node,
-                    // since it has a fixed size based on the container size.
-                    let track_rect = Rect {
-                        left: container_rect.right,
-                        top: container_rect.top,
-                        right: container_rect.right + 1,
-                        bottom: container_rect.bottom,
-                    };
-                    if track_rect.contains(self.tui.mouse_down_position) {
-                        let content = Tree::node_ref(prev_container.children.first).unwrap();
-                        let content_rect = content.inner;
-                        let track_height = track_rect.height();
-                        let content_height = content_rect.height();
+                match self.input_mouse_gesture {
+                    InputMouseGesture::Drag => {
+                        // We don't need to look up the previous track node,
+                        // since it has a fixed size based on the container size.
+                        let track_rect = Rect {
+                            left: container_rect.right,
+                            top: container_rect.top,
+                            right: container_rect.right + 1,
+                            bottom: container_rect.bottom,
+                        };
+                        if track_rect.contains(self.tui.mouse_down_position) {
+                            if sc.scroll_offset_y_drag_start == CoordType::MIN {
+                                sc.scroll_offset_y_drag_start = sc.scroll_offset.y;
+                            }
 
-                        if content_height > track_height {
-                            scroll_offset.y +=
-                                delta.y * (content_height + track_height) / track_height;
+                            let content = Tree::node_ref(prev_container.children.first).unwrap();
+                            let content_rect = content.inner;
+                            let content_height = content_rect.height();
+                            let track_height = track_rect.height();
+
+                            if content_height > track_height {
+                                let trackable = track_height - sc.thumb_height;
+                                let scrollable_height = content_height - track_height;
+                                let delta_y =
+                                    self.tui.mouse_position.y - self.tui.mouse_down_position.y;
+                                sc.scroll_offset.y = sc.scroll_offset_y_drag_start
+                                    + ((delta_y * scrollable_height) / trackable);
+                            }
+
+                            self.set_input_consumed();
                         }
-
-                        self.set_input_consumed();
                     }
+                    _ => match self.tui.mouse_state {
+                        InputMouseState::Release => {
+                            sc.scroll_offset_y_drag_start = CoordType::MIN;
+                        }
+                        InputMouseState::Scroll => {
+                            if container_rect.contains(self.tui.mouse_position) {
+                                sc.scroll_offset.x += self.input_scroll_delta.x;
+                                sc.scroll_offset.y += self.input_scroll_delta.y;
+                                self.set_input_consumed();
+                            }
+                        }
+                        _ => {}
+                    },
                 }
             }
         }
@@ -2653,9 +2686,18 @@ struct TextContent {
 struct TextareaContent {
     buffer: RcTextBuffer,
     scroll_offset: Point,
+    scroll_offset_y_drag_start: CoordType,
+    thumb_height: CoordType,
     preferred_column: CoordType,
     single_line: bool,
     has_focus: bool,
+}
+
+#[derive(Clone)]
+struct ScrollareaContent {
+    scroll_offset: Point,
+    scroll_offset_y_drag_start: CoordType,
+    thumb_height: CoordType,
 }
 
 #[derive(Default)]
@@ -2667,7 +2709,7 @@ enum NodeContent {
     Table(TableContent),
     Text(TextContent),
     Textarea(TextareaContent),
-    Scrollarea(Point), // scroll offset
+    Scrollarea(ScrollareaContent),
 }
 
 struct ScrollareaThumb {
@@ -2971,7 +3013,7 @@ impl Node {
                     y += row_height + spec.cell_gap.height;
                 }
             }
-            NodeContent::Scrollarea(pos) => {
+            NodeContent::Scrollarea(sc) => {
                 let Some(content) = Tree::node_mut(self.children.first) else {
                     unreachable!();
                 };
@@ -2984,10 +3026,10 @@ impl Node {
                 let cy = content.intrinsic_size.height.max(sy);
                 // scroll offset
                 let ox = 0;
-                let oy = pos.y.clamp(0, cy - sy);
+                let oy = sc.scroll_offset.y.clamp(0, cy - sy);
 
-                pos.x = ox;
-                pos.y = oy;
+                sc.scroll_offset.x = ox;
+                sc.scroll_offset.y = oy;
 
                 content.outer.left = self.inner.left - ox;
                 content.outer.top = self.inner.top - oy;
