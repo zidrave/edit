@@ -190,7 +190,6 @@ impl<'doc> MeasurementConfig<'doc> {
                 }
 
                 let props_current_cluster = props_next_cluster;
-                let is_tab = ch == '\t';
                 let mut offset_next_cluster;
                 let mut width = 0;
                 let mut state = 0;
@@ -214,9 +213,10 @@ impl<'doc> MeasurementConfig<'doc> {
                     }
                 }
 
+                let prev_char = chunk[offset_next_cluster - 1];
                 let offset_next_cluster = chunk_beg + offset_next_cluster;
 
-                if is_tab {
+                if prev_char == b'\t' {
                     // Tabs require special handling because they can have a variable width.
                     width = tab_size - (column % tab_size);
                 } else {
@@ -224,7 +224,7 @@ impl<'doc> MeasurementConfig<'doc> {
                 }
 
                 // Hard wrap: Both the logical and visual position advance by one line.
-                if ucd_grapheme_cluster_is_newline(props_current_cluster) {
+                if prev_char == b'\n' {
                     // Don't cross the newline if the target is on this line.
                     // E.g. if the callers asks for column 100 on a 10 column line,
                     // we'll return with the cursor set to column 10.
@@ -539,10 +539,10 @@ impl WordNavigation for WordBackward<'_> {
     fn skip_newline(&mut self) {
         // We can rely on the fact that the document does not split graphemes across chunks.
         // = If there's a newline it's wholly contained in this chunk.
-        if self.chunk_off > 0 && self.chunk[self.chunk_off - 1] == b'\r' {
+        if self.chunk_off > 0 && self.chunk[self.chunk_off - 1] == b'\n' {
             self.chunk_off -= 1;
         }
-        if self.chunk_off > 0 && self.chunk[self.chunk_off - 1] == b'\n' {
+        if self.chunk_off > 0 && self.chunk[self.chunk_off - 1] == b'\r' {
             self.chunk_off -= 1;
         }
     }

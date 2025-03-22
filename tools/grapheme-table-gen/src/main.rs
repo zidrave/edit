@@ -1,7 +1,7 @@
 mod rules;
 
 use crate::rules::{JOIN_RULES_GRAPHEME_CLUSTER, JOIN_RULES_LINE_BREAK};
-use anyhow::{bail, Context};
+use anyhow::{Context, bail};
 use indoc::writedoc;
 use rayon::prelude::*;
 use std::collections::HashMap;
@@ -20,9 +20,13 @@ enum CharacterWidth {
     Ambiguous,
 }
 
+// NOTE: The order of these items must match JOIN_RULES_GRAPHEME_CLUSTER.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum ClusterBreak {
     Other,         // GB999
+    CR,            // GB3, GB4, GB5
+    LF,            // GB3, GB4, GB5
+    Control,       // GB4, GB5
     Extend,        // GB9, GB9a -- includes SpacingMark
     RI,            // GB12, GB13
     Prepend,       // GB9b
@@ -35,14 +39,9 @@ enum ClusterBreak {
     InCBConsonant, // GB9c
     ExtPic,        // GB11
     ZWJ,           // GB9, GB11
-
-    // These are intentionally ordered last, as this allows us to
-    // simplify the ucd_grapheme_cluster_is_newline implementation.
-    Control, // GB4, GB5
-    CR,      // GB3, GB4, GB5
-    LF,      // GB3, GB4, GB5
 }
 
+// NOTE: The order of these items must match JOIN_RULES_LINE_BREAK.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[allow(non_camel_case_types)]
 enum LineBreak {
@@ -318,12 +317,7 @@ fn generate_c(out: Output) -> String {
         {{
             return (val >> 4) & 3;
         }}
-        inline bool ucd_grapheme_cluster_is_newline(const int val)
-        {{
-            return (val & 15) > {};
-        }}
         ",
-        ClusterBreak::Control as u32,
     );
 
     if out.arg_line_breaks {
@@ -423,14 +417,14 @@ fn generate_rust(out: Output) -> String {
         } else if stage.index != out.trie.stages.len() - 1 {
             _ = writeln!(
                 buf,
-                "    let s = STAGE{}[s + (cp & {})] as usize;",
-                stage.index, stage.mask,
+                "    let s = STAGE{}[s + ((cp >> {}) & {})] as usize;",
+                stage.index, stage.shift, stage.mask,
             );
         } else {
             _ = writeln!(
                 buf,
-                "    STAGE{}[s + ((cp >> {}) & {})] as usize",
-                stage.index, stage.shift, stage.mask,
+                "    STAGE{}[s + (cp & {})] as usize",
+                stage.index, stage.mask,
             );
         }
     }
@@ -453,12 +447,7 @@ fn generate_rust(out: Output) -> String {
         pub fn ucd_grapheme_cluster_character_width(val: usize) -> usize {{
             (val >> 4) & 3
         }}
-        #[inline(always)]
-        pub fn ucd_grapheme_cluster_is_newline(val: usize) -> bool {{
-            (val & 15) > {}
-        }}
         ",
-        ClusterBreak::Control as u32,
     );
 
     if out.arg_line_breaks {
