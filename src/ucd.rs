@@ -579,6 +579,10 @@ impl WordNavigation for WordBackward<'_> {
     }
 }
 
+// TODO: This code could be optimized by replacing memchr with manual line counting.
+// If `line_stop` is very far away, we could accumulate newline counts horizontally
+// in a AVX2 register (= 32 u8 slots). Then, every 256 bytes we compute the horizontal
+// sum via `_mm256_sad_epu8` yielding us the newline count in the last block.
 pub fn newlines_forward(
     text: &[u8],
     mut offset: usize,
@@ -595,17 +599,12 @@ pub fn newlines_forward(
     offset = offset.min(len);
 
     loop {
-        offset = memchr2(b'\r', b'\n', text, offset);
+        offset = memchr2(b'\n', b'\n', text, offset);
         if offset >= len {
             break;
         }
 
-        let ch = text[offset];
         offset += 1;
-        if ch == b'\r' && offset != len && text[offset] == b'\n' {
-            offset += 1;
-        }
-
         line += 1;
         if line >= line_stop {
             break;
@@ -627,7 +626,7 @@ pub fn newlines_backward(
     offset = offset.min(text.len());
 
     loop {
-        offset = match memrchr2(b'\r', b'\n', text, offset) {
+        offset = match memrchr2(b'\n', b'\n', text, offset) {
             Some(i) => i,
             None => return (0, line),
         };
@@ -635,11 +634,6 @@ pub fn newlines_backward(
             // +1: Past the newline, at the start of the current line.
             return (offset + 1, line);
         }
-
-        if text[offset] == b'\n' && offset != 0 && text[offset - 1] == b'\r' {
-            offset -= 1;
-        }
-
         line -= 1;
     }
 }
