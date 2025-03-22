@@ -1,8 +1,8 @@
-use crate::apperr;
+use crate::{apperr, helpers};
 use std::ffi::{CStr, c_int, c_void};
+use std::fmt::Write as _;
 use std::fs::File;
-use std::io::{ErrorKind, Read, Write};
-use std::mem::{self, ManuallyDrop, MaybeUninit};
+use std::mem;
 use std::os::fd::FromRawFd;
 use std::ptr::{null, null_mut};
 use std::thread;
@@ -153,73 +153,64 @@ pub fn read_stdin(timeout: time::Duration) -> Option<String> {
             }
         }
 
-        #[allow(invalid_value)]
-        let mut buf: [u8; 1024] = MaybeUninit::uninit().assume_init();
-        let mut read = 0;
+        let mut buf = Vec::with_capacity(1024);
 
         if STATE.utf8_len != 0 {
-            read = STATE.utf8_len;
-            input[..read].copy_from_slice(&STATE.utf8_buf[..read]);
+            buf.extend_from_slice(&STATE.utf8_buf[..STATE.utf8_len]);
+            STATE.utf8_len = 0;
         }
 
+        // Read new data
         loop {
-            if STATE.inject_resize {
-                STATE.inject_resize = false;
-                let (w, h) = get_window_size();
-                return Some(format!("\x1b[8;{};{}t", h, w));
+            let spare = buf.spare_capacity_mut();
+            let ret = libc::read(STATE.stdin, spare.as_mut_ptr() as *mut _, spare.len());
+            if ret > 0 {
+                buf.set_len(buf.len() + ret as usize);
+                break;
             }
-
-            // Read new data
-            let n = loop {
-                let ret = libc::read(STATE.stdin, buf.as_mut_ptr() as *mut _, buf.len());
-                if ret > 0 {
-                    break ret as usize;
-                }
-                if ret == 0 {
-                    return None;
-                }
-                if *libc::__errno_location() != libc::EINTR {
-                    return None;
-                }
-            };
-
-            // Prepend any cached incomplete UTF-8 sequence
-            let input = if STATE.utf8_len > 0 {
-                let total = STATE.utf8_len + n;
-                let mut combined = Vec::with_capacity(total);
-                combined.extend_from_slice(&STATE.utf8_buf[..STATE.utf8_len]);
-                combined.extend_from_slice(&buf[..n]);
-                STATE.utf8_len = 0;
-                combined
-            } else {
-                buf[..n].to_vec()
-            };
-
-            // Find last complete UTF-8 sequence
-            let mut valid_end = input.len();
-            while valid_end > 0 && (input[valid_end - 1] & 0xC0) == 0x80 {
-                valid_end -= 1;
-                if input.len() - valid_end >= 4 || valid_end == 0 {
-                    // Either too many trail bytes or all trail bytes - invalid UTF-8
-                    valid_end = input.len();
-                    break;
-                }
-            }
-
-            // Cache incomplete sequence if any
-            if valid_end < input.len() {
-                let remaining = input.len() - valid_end;
-                STATE.utf8_buf[..remaining].copy_from_slice(&input[valid_end..]);
-                STATE.utf8_len = remaining;
-            }
-
-            // Convert valid portion to string
-            if let Ok(s) = String::from_utf8(input[..valid_end].to_vec()) {
-                if !s.is_empty() {
-                    return Some(s);
-                }
+            if ret == 0 || *libc::__errno_location() != libc::EINTR {
+                return None;
             }
         }
+
+        if !buf.is_empty() {
+            // We only need to check the last 3 bytes for UTF-8 continuation bytes,
+            // because we should be able to assume that any 4 byte sequence is complete.
+            let lim = buf.len().saturating_sub(3);
+            let mut off = buf.len() - 1;
+
+            // Find the start of the last potentially incomplete UTF-8 sequence.
+            while off > lim && buf[off] & 0b1100_0000 == 0b1000_0000 {
+                off -= 1;
+            }
+
+            let seq_len = match buf[off] {
+                b if b & 0b1000_0000 == 0 => 1,
+                b if b & 0b1110_0000 == 0b1100_0000 => 2,
+                b if b & 0b1111_0000 == 0b1110_0000 => 3,
+                b if b & 0b1111_1000 == 0b1111_0000 => 4,
+                // If the lead byte we found isn't actually one, we don't cache it.
+                // `string_from_utf8_lossy_owned` will replace it with U+FFFD.
+                _ => 0,
+            };
+
+            // Cache incomplete sequence if any.
+            if off + seq_len > buf.len() {
+                STATE.utf8_len = buf.len() - off;
+                STATE.utf8_buf[..STATE.utf8_len].copy_from_slice(&buf[off..]);
+                buf.truncate(off);
+            }
+        }
+
+        let mut input = helpers::string_from_utf8_lossy_owned(buf);
+
+        if STATE.inject_resize {
+            STATE.inject_resize = false;
+            let (w, h) = get_window_size();
+            _ = write!(input, "\x1b[8;{};{}t", h, w);
+        }
+
+        Some(input)
     }
 }
 
