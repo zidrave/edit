@@ -308,7 +308,7 @@ fn draw(ctx: &mut Context, state: &mut State) {
     }
 
     if state.wants_file_picker == StateFilePicker::Save {
-        draw_handle_save(state, None);
+        draw_handle_save(ctx, state, None);
     }
 
     if state.wants_encoding_change != StateEncodingChange::None {
@@ -832,13 +832,13 @@ fn draw_file_picker(ctx: &mut Context, state: &mut State) {
         if activated {
             if let Some(path) = draw_dialog_saveas_update_path(state) {
                 if state.wants_file_picker == StateFilePicker::Open {
-                    if draw_handle_load(state, Some(&path), None) {
+                    if draw_handle_load(ctx, state, Some(&path), None) {
                         save_path = Some(path);
                     }
                 } else if path.exists() && Some(&path) != state.path.as_ref() {
                     state.file_picker_overwrite_warning = Some(path);
                 } else {
-                    if draw_handle_save(state, Some(&path)) {
+                    if draw_handle_save(ctx, state, Some(&path)) {
                         save_path = Some(path);
                     }
                 };
@@ -891,7 +891,7 @@ fn draw_file_picker(ctx: &mut Context, state: &mut State) {
 
         if save {
             let path = state.file_picker_overwrite_warning.take();
-            if draw_handle_save(state, path.as_ref()) {
+            if draw_handle_save(ctx, state, path.as_ref()) {
                 save_path = path;
             }
             state.file_picker_overwrite_warning = None;
@@ -983,6 +983,7 @@ fn draw_dialog_saveas_refresh_files(state: &mut State) {
 }
 
 fn draw_handle_load(
+    ctx: &mut Context,
     state: &mut State,
     path: Option<&PathBuf>,
     encoding: Option<&'static str>,
@@ -994,16 +995,18 @@ fn draw_handle_load(
             error_log_add(state, err);
             return false;
         }
+        ctx.needs_rerender();
     }
     true
 }
 
-fn draw_handle_save(state: &mut State, path: Option<&PathBuf>) -> bool {
+fn draw_handle_save(ctx: &mut Context, state: &mut State, path: Option<&PathBuf>) -> bool {
     if let Some(path) = path.or(state.path.as_ref()) {
         if let Err(err) = state.buffer.write_file(path) {
             error_log_add(state, err);
             return false;
         }
+        ctx.needs_rerender();
     }
 
     // Redundant with the `draw_file_picker()` caller, but crucial for `draw()`.
@@ -1043,9 +1046,9 @@ fn draw_dialog_encoding_change(ctx: &mut Context, state: &mut State) {
                     state.wants_encoding_change = StateEncodingChange::None;
                     if reopen && state.path.is_some() {
                         if state.buffer.is_dirty() {
-                            draw_handle_save(state, None);
+                            draw_handle_save(ctx, state, None);
                         }
-                        draw_handle_load(state, None, Some(encoding.as_str()));
+                        draw_handle_load(ctx, state, None, Some(encoding.as_str()));
                     } else {
                         state.buffer.set_encoding(encoding.as_str());
                     }

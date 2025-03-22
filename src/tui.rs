@@ -1023,7 +1023,7 @@ impl Context<'_, '_> {
         &self.tui.clipboard
     }
 
-    fn set_needs_settling(&mut self) {
+    pub fn needs_rerender(&mut self) {
         // If this hits, the call stack is responsible is trying to deadlock you.
         debug_assert!(self.tui.settling_have < 100);
         self.needs_settling = true;
@@ -1085,7 +1085,7 @@ impl Context<'_, '_> {
     fn steal_focus_for(&mut self, node: &Node) {
         if !self.tui.is_node_focused(node.id) {
             Tui::build_node_path(Some(node), &mut self.tui.focused_node_path);
-            self.set_needs_settling();
+            self.needs_rerender();
         }
     }
 
@@ -1097,7 +1097,7 @@ impl Context<'_, '_> {
             && self.tui.is_node_focused(current_node.id)
         {
             self.tui.pop_focusable_node(1);
-            self.set_needs_settling();
+            self.needs_rerender();
         }
     }
 
@@ -1114,7 +1114,7 @@ impl Context<'_, '_> {
         parent.attributes.focusable = true;
 
         if self.tui.is_node_focused(parent.id) {
-            self.set_needs_settling();
+            self.needs_rerender();
             self.tui.focused_node_path.insert(0, last_node.id);
         }
     }
@@ -2113,7 +2113,7 @@ impl Context<'_, '_> {
             content.selected_node = item;
             if !selected_before {
                 content.selected = item_id;
-                self.set_needs_settling();
+                self.needs_rerender();
             }
         }
 
@@ -2217,7 +2217,7 @@ impl Context<'_, '_> {
         if self.contains_focus() {
             if self.consume_shortcut(vk::ESCAPE) {
                 // TODO: This should reassign the previous focused path.
-                self.set_needs_settling();
+                self.needs_rerender();
                 self.tui.focused_node_path.clear();
                 self.tui.focused_node_path.push(ROOT_ID);
                 return false;
@@ -2256,7 +2256,7 @@ impl Context<'_, '_> {
 
         if clicked {
             // TODO: This should reassign the previous focused path.
-            self.set_needs_settling();
+            self.needs_rerender();
             self.tui.focused_node_path.clear();
             self.tui.focused_node_path.push(ROOT_ID);
         }
@@ -2323,7 +2323,7 @@ impl Context<'_, '_> {
             .unwrap();
 
         Tui::build_node_path(Some(focused_node), &mut self.tui.focused_node_path);
-        self.set_needs_settling();
+        self.needs_rerender();
 
         self.set_input_consumed();
     }
