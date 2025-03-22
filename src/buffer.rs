@@ -655,8 +655,8 @@ impl TextBuffer {
 
         // If we don't have file metadata, the input may be a pipe or a socket.
         // Every read will have the same size until we hit the end.
-        let mut chunk_size = 64 * 1024;
-        let mut extra_chunk_size = 8 * 1024;
+        let mut chunk_size = 128 * 1024;
+        let mut extra_chunk_size = 128 * 1024;
 
         if let Ok(m) = file.metadata() {
             // Usually the next read of size `chunk_size` will read the entire file,
