@@ -4,9 +4,8 @@
         {
             "name": "Launch Debug",
             "preLaunchTask": "rust: cargo build",
-            "type": "cppvsdbg",
+            "type": "cppdbg",
             "request": "launch",
-            "console": "externalTerminal",
             "program": "${workspaceFolder}/target/debug/edit",
             "args": [
                 "${workspaceFolder}/README.md"

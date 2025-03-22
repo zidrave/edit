@@ -19,51 +19,6 @@ use windows_sys::Win32::System::Memory;
 use windows_sys::Win32::System::Threading;
 use windows_sys::w;
 
-pub fn preferred_languages() -> Vec<String> {
-    unsafe {
-        const LEN: usize = 256;
-
-        let mut lang_num = 0;
-        let mut lang_buf = [const { MaybeUninit::<u16>::uninit() }; LEN];
-        let mut lang_buf_len = lang_buf.len() as u32;
-        if Globalization::GetUserPreferredUILanguages(
-            Globalization::MUI_LANGUAGE_NAME,
-            &mut lang_num,
-            lang_buf[0].as_mut_ptr(),
-            &mut lang_buf_len,
-        ) == 0
-            || lang_num == 0
-        {
-            return Vec::new();
-        }
-
-        // Drop the terminating double-null character.
-        lang_buf_len = lang_buf_len.saturating_sub(1);
-
-        let mut lang_buf_utf8 = [const { MaybeUninit::<u8>::uninit() }; 3 * LEN];
-        let lang_buf_utf8_len = Globalization::WideCharToMultiByte(
-            Globalization::CP_UTF8,
-            0,
-            lang_buf[0].as_mut_ptr(),
-            lang_buf_len as i32,
-            lang_buf_utf8[0].as_mut_ptr(),
-            lang_buf_utf8.len() as i32,
-            null(),
-            null_mut(),
-        );
-        if lang_buf_utf8_len == 0 {
-            return Vec::new();
-        }
-
-        let result = helpers::str_from_raw_parts_mut(
-            lang_buf_utf8[0].as_mut_ptr(),
-            lang_buf_utf8_len as usize,
-        );
-        result.make_ascii_lowercase();
-        result.split_terminator('\0').map(String::from).collect()
-    }
-}
-
 type ReadConsoleInputExW = unsafe extern "system" fn(
     h_console_input: Foundation::HANDLE,
     lp_buffer: *mut Console::INPUT_RECORD,
@@ -71,6 +26,16 @@ type ReadConsoleInputExW = unsafe extern "system" fn(
     lp_number_of_events_read: *mut u32,
     w_flags: u16,
 ) -> Foundation::BOOL;
+
+unsafe extern "system" fn read_console_input_ex_placeholder(
+    _: Foundation::HANDLE,
+    _: *mut Console::INPUT_RECORD,
+    _: u32,
+    _: *mut u32,
+    _: u16,
+) -> Foundation::BOOL {
+    panic!();
+}
 
 const CONSOLE_READ_NOWAIT: u16 = 0x0002;
 
@@ -99,16 +64,6 @@ static mut STATE: State = State {
     inject_resize: false,
     wants_exit: false,
 };
-
-unsafe extern "system" fn read_console_input_ex_placeholder(
-    _: Foundation::HANDLE,
-    _: *mut Console::INPUT_RECORD,
-    _: u32,
-    _: *mut u32,
-    _: u16,
-) -> Foundation::BOOL {
-    panic!();
-}
 
 extern "system" fn console_ctrl_handler(_ctrl_type: u32) -> Foundation::BOOL {
     unsafe {
@@ -235,13 +190,6 @@ pub fn read_stdin(timeout: time::Duration) -> Option<String> {
         unsafe { STATE.inject_resize = false };
     }
 
-    if unsafe { STATE.leading_surrogate } != 0 {
-        utf16_buf[0] = MaybeUninit::new(unsafe { STATE.leading_surrogate });
-        utf16_buf_len = 1;
-        input_buf_cap -= 1;
-        unsafe { STATE.leading_surrogate = 0 };
-    }
-
     if timeout != time::Duration::MAX {
         read_poll = true;
         let wait_result =
@@ -260,6 +208,13 @@ pub fn read_stdin(timeout: time::Duration) -> Option<String> {
     // This loops exists, just in case there's events in the input buffer that we aren't interested in.
     // It should be rare for this to loop.
     while read_more {
+        if unsafe { STATE.leading_surrogate } != 0 {
+            utf16_buf[0] = MaybeUninit::new(unsafe { STATE.leading_surrogate });
+            utf16_buf_len = 1;
+            input_buf_cap -= 1;
+            unsafe { STATE.leading_surrogate = 0 };
+        }
+
         let input = unsafe {
             // If we had a `inject_resize`, we don't want to block indefinitely for other pending input on startup,
             // but are still interested in any other pending input that may be waiting for us.
@@ -474,6 +429,51 @@ pub unsafe fn get_proc_address<T>(handle: Foundation::HMODULE, name: &CStr) -> a
 
 pub unsafe fn load_icu() -> apperr::Result<Foundation::HMODULE> {
     unsafe { load_library(w!("icu.dll")) }
+}
+
+pub fn preferred_languages() -> Vec<String> {
+    unsafe {
+        const LEN: usize = 256;
+
+        let mut lang_num = 0;
+        let mut lang_buf = [const { MaybeUninit::<u16>::uninit() }; LEN];
+        let mut lang_buf_len = lang_buf.len() as u32;
+        if Globalization::GetUserPreferredUILanguages(
+            Globalization::MUI_LANGUAGE_NAME,
+            &mut lang_num,
+            lang_buf[0].as_mut_ptr(),
+            &mut lang_buf_len,
+        ) == 0
+            || lang_num == 0
+        {
+            return Vec::new();
+        }
+
+        // Drop the terminating double-null character.
+        lang_buf_len = lang_buf_len.saturating_sub(1);
+
+        let mut lang_buf_utf8 = [const { MaybeUninit::<u8>::uninit() }; 3 * LEN];
+        let lang_buf_utf8_len = Globalization::WideCharToMultiByte(
+            Globalization::CP_UTF8,
+            0,
+            lang_buf[0].as_mut_ptr(),
+            lang_buf_len as i32,
+            lang_buf_utf8[0].as_mut_ptr(),
+            lang_buf_utf8.len() as i32,
+            null(),
+            null_mut(),
+        );
+        if lang_buf_utf8_len == 0 {
+            return Vec::new();
+        }
+
+        let result = helpers::str_from_raw_parts_mut(
+            lang_buf_utf8[0].as_mut_ptr(),
+            lang_buf_utf8_len as usize,
+        );
+        result.make_ascii_lowercase();
+        result.split_terminator('\0').map(String::from).collect()
+    }
 }
 
 #[cold]

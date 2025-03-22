@@ -8,21 +8,26 @@ use std::ptr::{null, null_mut};
 use std::thread;
 use std::time;
 
-pub fn preferred_languages() -> Vec<String> {
-    let mut locales = Vec::new();
-
-    for key in ["LANGUAGE", "LC_ALL", "LANG"] {
-        if let Ok(val) = std::env::var(key) {
-            locales.extend(
-                val.split(':')
-                    .filter(|val| !val.is_empty())
-                    .map(String::from),
-            );
-        }
-    }
-
-    locales
+struct State {
+    stdin: libc::c_int,
+    stdin_flags: libc::c_int,
+    stdout: libc::c_int,
+    stdout_initial_termios: libc::termios,
+    inject_resize: bool,
+    // Buffer for incomplete UTF-8 sequences (max 4 bytes needed)
+    utf8_buf: [u8; 4],
+    utf8_len: usize,
 }
+
+static mut STATE: State = State {
+    stdin: libc::STDIN_FILENO,
+    stdin_flags: 0,
+    stdout: libc::STDOUT_FILENO,
+    stdout_initial_termios: unsafe { mem::zeroed() },
+    inject_resize: false,
+    utf8_buf: [0; 4],
+    utf8_len: 0,
+};
 
 extern "C" fn sigwinch_handler(_: libc::c_int) {
     unsafe {
@@ -39,6 +44,8 @@ pub fn init() -> apperr::Result<()> {
         if libc::isatty(STATE.stdout) == 0 {
             STATE.stdout = check_int_return(libc::open(c"/dev/tty".as_ptr(), libc::O_WRONLY))?;
         }
+
+        STATE.stdin_flags = check_int_return(libc::fcntl(STATE.stdin, libc::F_GETFL))?;
 
         check_int_return(libc::tcgetattr(
             STATE.stdout,
@@ -108,25 +115,6 @@ fn get_window_size() -> (u16, u16) {
     (w, h)
 }
 
-struct State {
-    stdin: libc::c_int,
-    stdout: libc::c_int,
-    stdout_initial_termios: libc::termios,
-    inject_resize: bool,
-    // Buffer for incomplete UTF-8 sequences (max 4 bytes needed)
-    utf8_buf: [u8; 4],
-    utf8_len: usize,
-}
-
-static mut STATE: State = State {
-    stdin: libc::STDIN_FILENO,
-    stdout: libc::STDOUT_FILENO,
-    stdout_initial_termios: unsafe { mem::zeroed() },
-    inject_resize: false,
-    utf8_buf: [0; 4],
-    utf8_len: 0,
-};
-
 /// Reads from stdin.
 ///
 /// Returns `None` if there was an error reading from stdin.
@@ -134,6 +122,13 @@ static mut STATE: State = State {
 /// Otherwise, it returns the read, non-empty string.
 pub fn read_stdin(timeout: time::Duration) -> Option<String> {
     unsafe {
+        let mut read_more = true;
+        let mut read_poll = false;
+
+        if STATE.inject_resize {
+            read_poll = true;
+        }
+
         if timeout != time::Duration::MAX {
             let mut pollfd = libc::pollfd {
                 fd: STATE.stdin,
@@ -148,61 +143,77 @@ pub fn read_stdin(timeout: time::Duration) -> Option<String> {
             if ret < 0 {
                 return None;
             }
+
+            read_poll = true; // there is a timeout -> don't block in read()
             if ret == 0 {
-                return Some(String::new());
+                read_more = false; // if timeout -> don't read
             }
+        };
+
+        let mut input = String::new();
+
+        if read_more {
+            let mut buf = Vec::with_capacity(1024);
+
+            if STATE.utf8_len != 0 {
+                buf.extend_from_slice(&STATE.utf8_buf[..STATE.utf8_len]);
+                STATE.utf8_len = 0;
+            }
+
+            let is_nonblock = (STATE.stdin_flags & libc::O_NONBLOCK) != 0;
+            if read_poll != is_nonblock {
+                STATE.stdin_flags ^= libc::O_NONBLOCK;
+                let _ = libc::fcntl(STATE.stdin, libc::F_SETFL, STATE.stdin_flags);
+            }
+
+            loop {
+                let spare = buf.spare_capacity_mut();
+                let ret = libc::read(STATE.stdin, spare.as_mut_ptr() as *mut _, spare.len());
+                if ret > 0 {
+                    buf.set_len(buf.len() + ret as usize);
+                    break;
+                }
+                if ret == 0 {
+                    return None;
+                }
+                match *libc::__errno_location() {
+                    libc::EINTR => continue,
+                    libc::EAGAIN => break,
+                    _ => return None,
+                }
+            }
+
+            if !buf.is_empty() {
+                // We only need to check the last 3 bytes for UTF-8 continuation bytes,
+                // because we should be able to assume that any 4 byte sequence is complete.
+                let lim = buf.len().saturating_sub(3);
+                let mut off = buf.len() - 1;
+
+                // Find the start of the last potentially incomplete UTF-8 sequence.
+                while off > lim && buf[off] & 0b1100_0000 == 0b1000_0000 {
+                    off -= 1;
+                }
+
+                let seq_len = match buf[off] {
+                    b if b & 0b1000_0000 == 0 => 1,
+                    b if b & 0b1110_0000 == 0b1100_0000 => 2,
+                    b if b & 0b1111_0000 == 0b1110_0000 => 3,
+                    b if b & 0b1111_1000 == 0b1111_0000 => 4,
+                    // If the lead byte we found isn't actually one, we don't cache it.
+                    // `string_from_utf8_lossy_owned` will replace it with U+FFFD.
+                    _ => 0,
+                };
+
+                // Cache incomplete sequence if any.
+                if off + seq_len > buf.len() {
+                    STATE.utf8_len = buf.len() - off;
+                    STATE.utf8_buf[..STATE.utf8_len].copy_from_slice(&buf[off..]);
+                    buf.truncate(off);
+                }
+            }
+
+            input = helpers::string_from_utf8_lossy_owned(buf);
         }
-
-        let mut buf = Vec::with_capacity(1024);
-
-        if STATE.utf8_len != 0 {
-            buf.extend_from_slice(&STATE.utf8_buf[..STATE.utf8_len]);
-            STATE.utf8_len = 0;
-        }
-
-        // Read new data
-        loop {
-            let spare = buf.spare_capacity_mut();
-            let ret = libc::read(STATE.stdin, spare.as_mut_ptr() as *mut _, spare.len());
-            if ret > 0 {
-                buf.set_len(buf.len() + ret as usize);
-                break;
-            }
-            if ret == 0 || *libc::__errno_location() != libc::EINTR {
-                return None;
-            }
-        }
-
-        if !buf.is_empty() {
-            // We only need to check the last 3 bytes for UTF-8 continuation bytes,
-            // because we should be able to assume that any 4 byte sequence is complete.
-            let lim = buf.len().saturating_sub(3);
-            let mut off = buf.len() - 1;
-
-            // Find the start of the last potentially incomplete UTF-8 sequence.
-            while off > lim && buf[off] & 0b1100_0000 == 0b1000_0000 {
-                off -= 1;
-            }
-
-            let seq_len = match buf[off] {
-                b if b & 0b1000_0000 == 0 => 1,
-                b if b & 0b1110_0000 == 0b1100_0000 => 2,
-                b if b & 0b1111_0000 == 0b1110_0000 => 3,
-                b if b & 0b1111_1000 == 0b1111_0000 => 4,
-                // If the lead byte we found isn't actually one, we don't cache it.
-                // `string_from_utf8_lossy_owned` will replace it with U+FFFD.
-                _ => 0,
-            };
-
-            // Cache incomplete sequence if any.
-            if off + seq_len > buf.len() {
-                STATE.utf8_len = buf.len() - off;
-                STATE.utf8_buf[..STATE.utf8_len].copy_from_slice(&buf[off..]);
-                buf.truncate(off);
-            }
-        }
-
-        let mut input = helpers::string_from_utf8_lossy_owned(buf);
 
         if STATE.inject_resize {
             STATE.inject_resize = false;
@@ -308,6 +319,22 @@ pub unsafe fn get_proc_address<T>(handle: *mut c_void, name: &CStr) -> apperr::R
 
 pub unsafe fn load_icu() -> apperr::Result<*mut c_void> {
     unsafe { load_library(c"icu.dll") }
+}
+
+pub fn preferred_languages() -> Vec<String> {
+    let mut locales = Vec::new();
+
+    for key in ["LANGUAGE", "LC_ALL", "LANG"] {
+        if let Ok(val) = std::env::var(key) {
+            locales.extend(
+                val.split(':')
+                    .filter(|val| !val.is_empty())
+                    .map(String::from),
+            );
+        }
+    }
+
+    locales
 }
 
 #[inline]
