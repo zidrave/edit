@@ -498,13 +498,18 @@ impl Framebuffer {
 
                 if last_bg != bg {
                     last_bg = bg;
-                    _ = write!(
-                        result,
-                        "\x1b[48;2;{};{};{}m",
-                        bg & 0xff,
-                        (bg >> 8) & 0xff,
-                        (bg >> 16) & 0xff
-                    );
+
+                    if bg == self.indexed(IndexedColor::DefaultBackground) {
+                        result.push_str("\x1b[49m");
+                    } else {
+                        _ = write!(
+                            result,
+                            "\x1b[48;2;{};{};{}m",
+                            bg & 0xff,
+                            (bg >> 8) & 0xff,
+                            (bg >> 16) & 0xff
+                        );
+                    }
                 }
 
                 if last_fg != fg {
