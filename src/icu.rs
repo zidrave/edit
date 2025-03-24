@@ -312,6 +312,25 @@ extern "C" fn utext_native_length(ut: &mut icu_ffi::UText) -> i64 {
 }
 
 extern "C" fn utext_access(ut: &mut icu_ffi::UText, native_index: i64, forward: bool) -> bool {
+    if let Some(cache) = utext_access_impl(ut, native_index, forward) {
+        let native_off = native_index as usize - cache.utf8_range.start;
+        ut.chunk_contents = cache.utf16.as_ptr();
+        ut.chunk_length = cache.utf16_len as i32;
+        ut.chunk_offset = cache.utf8_to_utf16_offsets[native_off] as i32;
+        ut.chunk_native_start = cache.utf8_range.start as i64;
+        ut.chunk_native_limit = cache.utf8_range.end as i64;
+        ut.native_indexing_limit = cache.native_indexing_limit as i32;
+        true
+    } else {
+        false
+    }
+}
+
+fn utext_access_impl<'a>(
+    ut: &mut icu_ffi::UText,
+    native_index: i64,
+    forward: bool,
+) -> Option<&'a mut Cache> {
     let tb = text_buffer_from_utext(ut);
     let mut index_contained = native_index;
 
@@ -319,7 +338,7 @@ extern "C" fn utext_access(ut: &mut icu_ffi::UText, native_index: i64, forward: 
         index_contained -= 1;
     }
     if index_contained < 0 || index_contained as usize >= tb.text_length() {
-        return false;
+        return None;
     }
 
     let index_contained = index_contained as usize;
@@ -334,21 +353,16 @@ extern "C" fn utext_access(ut: &mut icu_ffi::UText, native_index: i64, forward: 
         double_cache.cache[1].utf8_range = 0..0;
         ut.a = tb.get_generation() as i64;
     } else {
-        for cache in &double_cache.cache {
+        for (i, cache) in double_cache.cache.iter_mut().enumerate() {
             if cache.utf8_range.contains(&index_contained) {
-                ut.chunk_contents = cache.utf16.as_ptr();
-                ut.chunk_length = cache.utf16_len as i32;
-                ut.chunk_offset =
-                    cache.utf8_to_utf16_offsets[native_index - cache.utf8_range.start] as i32;
-                ut.chunk_native_start = cache.utf8_range.start as i64;
-                ut.chunk_native_limit = cache.utf8_range.end as i64;
-                ut.native_indexing_limit = cache.native_indexing_limit as i32;
-                return true;
+                double_cache.mru = i != 0;
+                return Some(cache);
             }
         }
     }
 
     // Turn the least recently used cache into the most recently used one.
+    let double_cache = double_cache_from_utext(ut);
     double_cache.mru = !double_cache.mru;
     let cache = &mut double_cache.cache[double_cache.mru as usize];
 
@@ -473,27 +487,19 @@ extern "C" fn utext_access(ut: &mut icu_ffi::UText, native_index: i64, forward: 
     cache.utf16_to_utf8_offsets[utf16_len] = utf8_len as u16;
     cache.utf8_to_utf16_offsets[utf8_len] = utf16_len as u16;
 
-    let native_limit = native_index + utf8_len;
+    let native_limit = native_start + utf8_len;
     cache.utf16_len = utf16_len;
-    cache.utf8_range = native_start..native_limit;
-
-    ut.chunk_contents = cache.utf16.as_ptr();
-    ut.chunk_length = cache.utf16_len as i32;
-    ut.chunk_offset = if forward { 0 } else { cache.utf16_len as i32 };
-    ut.chunk_native_start = native_start as i64;
-    ut.chunk_native_limit = native_limit as i64;
-    // If the entire UTF-8 chunk is ASCII, we can tell ICU that it doesn't need to call
+    // If parts of the UTF-8 chunk are ASCII, we can tell ICU that it doesn't need to call
     // utext_map_offset_to_native. For some reason, uregex calls that function *a lot*,
     // literally half the CPU time is spent on it.
-    ut.native_indexing_limit = ascii_len as i32;
-    true
+    cache.native_indexing_limit = ascii_len;
+    cache.utf8_range = native_start..native_limit;
+    Some(cache)
 }
 
-#[inline(never)]
-fn foo() {}
-
 extern "C" fn utext_map_offset_to_native(ut: &icu_ffi::UText) -> i64 {
-    debug_assert!(ut.chunk_offset >= 0 && ut.chunk_offset <= ut.chunk_length);
+    debug_assert!((0..=ut.chunk_length).contains(&ut.chunk_offset));
+
     let double_cache = double_cache_from_utext(ut);
     let cache = &double_cache.cache[double_cache.mru as usize];
     let off_rel = cache.utf16_to_utf8_offsets[ut.chunk_offset as usize];
@@ -502,7 +508,8 @@ extern "C" fn utext_map_offset_to_native(ut: &icu_ffi::UText) -> i64 {
 }
 
 extern "C" fn utext_map_native_index_to_utf16(ut: &icu_ffi::UText, native_index: i64) -> i32 {
-    debug_assert!(native_index >= ut.chunk_native_start && native_index <= ut.chunk_native_limit);
+    debug_assert!((ut.chunk_native_start..=ut.chunk_native_limit).contains(&native_index));
+
     let double_cache = double_cache_from_utext(ut);
     let cache = &double_cache.cache[double_cache.mru as usize];
     let off_rel = cache.utf8_to_utf16_offsets[(native_index - ut.chunk_native_start) as usize];
@@ -551,18 +558,16 @@ impl Regex {
         }
     }
 
-    pub unsafe fn refresh_text(&mut self, text: &Text) {
+    pub unsafe fn set_text(&mut self, text: &Text) {
         let f = assume_loaded();
         let mut status = icu_ffi::U_ZERO_ERROR;
         unsafe { (f.uregex_setUText)(self.0, text.0 as *const _ as *mut _, &mut status) };
-        assert!(status.is_success());
     }
 
     pub fn reset(&mut self, index: usize) {
         let f = assume_loaded();
         let mut status = icu_ffi::U_ZERO_ERROR;
         unsafe { (f.uregex_reset64)(self.0, index as i64, &mut status) };
-        assert!(status.is_success());
     }
 }
 
