@@ -1008,16 +1008,36 @@ impl TextBuffer {
         pattern: &str,
         options: SearchOptions,
     ) -> apperr::Result<ActiveSearch> {
-        let mut pattern = Cow::Borrowed(pattern);
-        let mut flags = icu::Regex::MULTILINE;
+        let sanitized_pattern = if options.whole_word && options.use_regex {
+            Cow::Owned(format!(r"\b(?:{})\b", pattern))
+        } else if options.whole_word {
+            let mut p = String::with_capacity(pattern.len() + 16);
+            p.push_str(r"\b");
 
+            // Escape regex special characters.
+            let b = unsafe { p.as_mut_vec() };
+            for &byte in pattern.as_bytes() {
+                match byte {
+                    b'*' | b'?' | b'+' | b'[' | b'(' | b')' | b'{' | b'}' | b'^' | b'$' | b'|'
+                    | b'\\' | b'.' => {
+                        b.push(b'\\');
+                        b.push(byte);
+                    }
+                    _ => b.push(byte),
+                }
+            }
+
+            p.push_str(r"\b");
+            Cow::Owned(p)
+        } else {
+            Cow::Borrowed(pattern)
+        };
+
+        let mut flags = icu::Regex::MULTILINE;
         if !options.match_case {
             flags |= icu::Regex::CASE_INSENSITIVE;
         }
-        if options.whole_word {
-            pattern = Cow::Owned(format!(r"\b(?:{})\b", pattern));
-        }
-        if !options.use_regex {
+        if !options.use_regex && !options.whole_word {
             flags |= icu::Regex::LITERAL;
         }
 
@@ -1025,7 +1045,7 @@ impl TextBuffer {
         // or otherwise to the current cursor position.
 
         let text = unsafe { icu::Text::new(self)? };
-        let regex = unsafe { icu::Regex::new(&pattern, flags, &text)? };
+        let regex = unsafe { icu::Regex::new(&sanitized_pattern, flags, &text)? };
 
         Ok(ActiveSearch {
             pattern: pattern.to_string(),
