@@ -114,28 +114,12 @@ struct State {
 
 impl State {
     fn new() -> apperr::Result<Self> {
-        let path = std::env::args_os()
-            .nth(1)
-            .and_then(|p| if p == "-" { None } else { Some(p) })
-            .map(PathBuf::from);
-        let filename = path
-            .as_ref()
-            .and_then(|p| p.file_name())
-            .unwrap_or_default()
-            .to_string_lossy()
-            .into_owned();
-
         let mut buffer = RcTextBuffer::new(false)?;
         buffer.set_margin_enabled(true);
-        buffer.set_ruler(if filename == "COMMIT_EDITMSG" {
-            Some(72)
-        } else {
-            None
-        });
 
         Ok(Self {
-            path,
-            filename: filename.clone(),
+            path: None,
+            filename: String::new(),
             buffer,
 
             error_log: [const { String::new() }; 10],
@@ -143,13 +127,18 @@ impl State {
             error_log_count: 0,
 
             wants_file_picker: StateFilePicker::None,
+            // TODO: Ideally this would use the directory of the given file path.
             file_picker_pending_dir: DisplayablePathBuf::new(std::env::current_dir()?),
-            file_picker_pending_name: filename,
+            file_picker_pending_name: String::new(),
             file_picker_entries: None,
             file_picker_overwrite_warning: None,
 
-            wants_search: StateSearch::Hidden,
+            wants_search: StateSearch {
+                kind: StateSearchKind::Hidden,
+                focus: false,
+            },
             search_needle: String::new(),
+            search_replacement: String::new(),
             search_options: buffer::SearchOptions::default(),
 
             wants_encoding_focus: false,
@@ -160,11 +149,15 @@ impl State {
             exit: false,
         })
     }
-}
 
-impl State {
-    fn update_path(&mut self, path: Option<PathBuf>) {
-        self.path = path;
+    fn set_path(&mut self, path: PathBuf, filename: String) {
+        self.buffer.set_ruler(if filename == "COMMIT_EDITMSG" {
+            Some(72)
+        } else {
+            None
+        });
+        self.filename = filename;
+        self.path = Some(path);
     }
 }
 
@@ -199,17 +192,21 @@ fn run() -> apperr::Result<()> {
     let mut input_parser = input::Parser::new();
     let mut tui = Tui::new();
 
-    if let Some(mut file) = sys::open_stdin_if_redirected() {
-        state.buffer.read_file(&mut file, None)?;
-        state.buffer.mark_as_dirty();
-    } else if let Some(path) = &state.path {
-        match file_open(path) {
-            Ok(mut file) => {
-                state.buffer.read_file(&mut file, None)?;
-            }
-            Err(apperr::APP_FILE_NOT_FOUND) => {}
+    if let Some(path) = std::env::args_os()
+        .nth(1)
+        .and_then(|p| if p == "-" { None } else { Some(p) })
+        .map(PathBuf::from)
+    {
+        let filename = get_filename_from_path(&path);
+        match file_open(&path) {
+            Ok(mut file) => state.buffer.read_file(&mut file, None)?,
+            Err(apperr::APP_FILE_NOT_FOUND) if !filename.is_empty() => {}
             Err(err) => return Err(err),
         }
+        state.set_path(path, filename);
+    } else if let Some(mut file) = sys::open_stdin_if_redirected() {
+        state.buffer.read_file(&mut file, None)?;
+        state.buffer.mark_as_dirty();
     }
 
     let _restore_modes = set_modes();
@@ -832,16 +829,19 @@ fn draw_file_picker(ctx: &mut Context, state: &mut State) {
         if activated {
             if let Some(path) = draw_dialog_saveas_update_path(state) {
                 if state.wants_file_picker == StateFilePicker::Open {
-                    if draw_handle_load(ctx, state, Some(&path), None) {
+                    // File Open? Just load the file and store the path if it was successful.
+                    if draw_handle_load_impl(ctx, state, Some(&path), None) {
                         save_path = Some(path);
                     }
-                } else if path.exists() && Some(&path) != state.path.as_ref() {
-                    state.file_picker_overwrite_warning = Some(path);
                 } else {
-                    if draw_handle_save(ctx, state, Some(&path)) {
+                    // File Save? Check if the file exists and show a warning if it does.
+                    // Otherwise, save the file and store the path if it was successful.
+                    if path.exists() && Some(&path) != state.path.as_ref() {
+                        state.file_picker_overwrite_warning = Some(path);
+                    } else if draw_handle_save_impl(ctx, state, Some(&path)) {
                         save_path = Some(path);
                     }
-                };
+                }
             }
         }
     }
@@ -891,17 +891,16 @@ fn draw_file_picker(ctx: &mut Context, state: &mut State) {
 
         if save {
             let path = state.file_picker_overwrite_warning.take();
-            if draw_handle_save(ctx, state, path.as_ref()) {
+            if draw_handle_save_impl(ctx, state, path.as_ref()) {
                 save_path = path;
             }
             state.file_picker_overwrite_warning = None;
         }
     }
 
-    if save_path.is_some() {
+    if let Some(path) = save_path {
         // Only update the path if the save was successful.
-        state.path = save_path;
-        state.filename = state.file_picker_pending_name.clone();
+        state.set_path(path, state.file_picker_pending_name.clone());
         state.wants_file_picker = StateFilePicker::None;
         state.file_picker_entries = None;
     }
@@ -925,11 +924,7 @@ fn draw_dialog_saveas_update_path(state: &mut State) -> Option<PathBuf> {
         (normalized.as_path(), String::new())
     } else {
         let dir = normalized.parent().unwrap_or(&normalized);
-        let name = normalized
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .into_owned();
+        let name = get_filename_from_path(&normalized);
         (dir, name)
     };
     if dir != state.file_picker_pending_dir.as_path() {
@@ -982,35 +977,44 @@ fn draw_dialog_saveas_refresh_files(state: &mut State) {
     state.file_picker_entries = Some(files);
 }
 
-fn draw_handle_load(
+fn draw_handle_load_impl(
     ctx: &mut Context,
     state: &mut State,
     path: Option<&PathBuf>,
     encoding: Option<&'static str>,
 ) -> bool {
-    if let Some(path) = path.or(state.path.as_ref()) {
-        if let Err(err) =
-            file_open(path).and_then(|mut file| state.buffer.read_file(&mut file, encoding))
-        {
-            error_log_add(state, err);
-            return false;
-        }
-        ctx.needs_rerender();
+    let Some(path) = path.or(state.path.as_ref()) else {
+        return false;
+    };
+
+    if let Err(err) =
+        file_open(path).and_then(|mut file| state.buffer.read_file(&mut file, encoding))
+    {
+        error_log_add(ctx, state, err);
+        return false;
     }
+
+    ctx.needs_rerender();
     true
 }
 
 fn draw_handle_save(ctx: &mut Context, state: &mut State, path: Option<&PathBuf>) -> bool {
-    if let Some(path) = path.or(state.path.as_ref()) {
-        if let Err(err) = state.buffer.write_file(path) {
-            error_log_add(state, err);
-            return false;
-        }
-        ctx.needs_rerender();
+    // Don't retry if the upcoming save fails.
+    state.wants_file_picker = StateFilePicker::None;
+    draw_handle_save_impl(ctx, state, path)
+}
+
+fn draw_handle_save_impl(ctx: &mut Context, state: &mut State, path: Option<&PathBuf>) -> bool {
+    let Some(path) = path.or(state.path.as_ref()) else {
+        return false;
+    };
+
+    if let Err(err) = state.buffer.write_file(path) {
+        error_log_add(ctx, state, err);
+        return false;
     }
 
-    // Redundant with the `draw_file_picker()` caller, but crucial for `draw()`.
-    state.wants_file_picker = StateFilePicker::None;
+    ctx.needs_rerender();
     true
 }
 
@@ -1046,11 +1050,12 @@ fn draw_dialog_encoding_change(ctx: &mut Context, state: &mut State) {
                     state.wants_encoding_change = StateEncodingChange::None;
                     if reopen && state.path.is_some() {
                         if state.buffer.is_dirty() {
-                            draw_handle_save(ctx, state, None);
+                            draw_handle_save_impl(ctx, state, None);
                         }
-                        draw_handle_load(ctx, state, None, Some(encoding.as_str()));
+                        draw_handle_load_impl(ctx, state, None, Some(encoding.as_str()));
                     } else {
                         state.buffer.set_encoding(encoding.as_str());
+                        ctx.needs_rerender();
                     }
                 }
             }
@@ -1159,16 +1164,22 @@ fn draw_error_log(ctx: &mut Context, state: &mut State) {
     ctx.modal_begin("errors", "Error");
     ctx.attr_background_rgba(ctx.indexed(IndexedColor::Red));
     {
-        let off = state.error_log_index + state.error_log.len() - state.error_log_count;
-        for i in 0..state.error_log_count {
-            let idx = (off + i) % state.error_log.len();
-            let msg = &state.error_log[idx][..];
-            if !msg.is_empty() {
-                ctx.next_block_id_mixin(i as u64);
-                ctx.label("error", Overflow::TruncateTail, msg);
-                ctx.attr_padding(Rect::three(if i == 0 { 1 } else { 0 }, 2, 1));
+        ctx.block_begin("content");
+        ctx.attr_padding(Rect::two(1, 2));
+        {
+            let off = state.error_log_index + state.error_log.len() - state.error_log_count;
+
+            for i in 0..state.error_log_count {
+                let idx = (off + i) % state.error_log.len();
+                let msg = &state.error_log[idx][..];
+
+                if !msg.is_empty() {
+                    ctx.next_block_id_mixin(i as u64);
+                    ctx.label("error", Overflow::TruncateTail, msg);
+                }
             }
         }
+        ctx.block_end();
 
         if ctx.button("ok", Overflow::Clip, "Ok") {
             state.error_log_count = 0;
@@ -1182,17 +1193,25 @@ fn draw_error_log(ctx: &mut Context, state: &mut State) {
     }
 }
 
-fn error_log_add(state: &mut State, err: apperr::Error) {
+fn error_log_add(ctx: &mut Context, state: &mut State, err: apperr::Error) {
     let msg = err.message();
     if !msg.is_empty() {
         state.error_log[state.error_log_index] = msg;
         state.error_log_index = (state.error_log_index + 1) % state.error_log.len();
         state.error_log_count = cmp::min(state.error_log_count + 1, state.error_log.len());
+        ctx.needs_rerender();
     }
 }
 
 fn file_open(path: &Path) -> apperr::Result<File> {
     File::open(path).map_err(apperr::Error::from)
+}
+
+fn get_filename_from_path(path: &Path) -> String {
+    path.file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned()
 }
 
 fn set_modes() -> RestoreModes {
