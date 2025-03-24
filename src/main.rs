@@ -385,9 +385,11 @@ fn draw_menu_file(ctx: &mut Context, state: &mut State) {
 fn draw_menu_edit(ctx: &mut Context, state: &mut State) {
     if ctx.menubar_menu_item(loc(LocId::EditUndo), 'U', kbmod::CTRL | vk::Z) {
         state.buffer.undo();
+        ctx.needs_rerender();
     }
     if ctx.menubar_menu_item(loc(LocId::EditRedo), 'R', kbmod::CTRL | vk::Y) {
         state.buffer.redo();
+        ctx.needs_rerender();
     }
     if ctx.menubar_menu_item(loc(LocId::EditCut), 'T', kbmod::CTRL | vk::X) {
         ctx.set_clipboard(state.buffer.extract_selection(true));
@@ -397,6 +399,7 @@ fn draw_menu_edit(ctx: &mut Context, state: &mut State) {
     }
     if ctx.menubar_menu_item(loc(LocId::EditPaste), 'P', kbmod::CTRL | vk::V) {
         state.buffer.write(ctx.get_clipboard(), true);
+        ctx.needs_rerender();
     }
     if !matches!(state.wants_search, StateSearch::Disabled)
         && ctx.menubar_menu_item(loc(LocId::EditFind), 'F', kbmod::CTRL | vk::F)
@@ -406,6 +409,7 @@ fn draw_menu_edit(ctx: &mut Context, state: &mut State) {
     if ctx.menubar_menu_item(loc(LocId::EditChangeNewlineSequence), 'N', vk::NULL) {
         let crlf = state.buffer.is_crlf();
         state.buffer.normalize_newlines(!crlf);
+        ctx.needs_rerender();
     }
     if ctx.menubar_menu_item(loc(LocId::EditChangeEncoding), 'E', vk::NULL) {
         state.wants_encoding_focus = true;
@@ -649,6 +653,7 @@ fn draw_statusbar(ctx: &mut Context, state: &mut State) {
                     ) != ListSelection::Unchanged
                     {
                         state.buffer.set_indent_with_tabs(true);
+                        ctx.needs_rerender();
                     }
                     if ctx.list_item(
                         !state.buffer.indent_with_tabs(),
@@ -657,6 +662,7 @@ fn draw_statusbar(ctx: &mut Context, state: &mut State) {
                     ) != ListSelection::Unchanged
                     {
                         state.buffer.set_indent_with_tabs(false);
+                        ctx.needs_rerender();
                     }
                 }
                 ctx.list_end();
@@ -675,6 +681,7 @@ fn draw_statusbar(ctx: &mut Context, state: &mut State) {
                         ) != ListSelection::Unchanged
                         {
                             state.buffer.set_tab_size(width as i32);
+                            ctx.needs_rerender();
                         }
                     }
                 }
@@ -706,6 +713,7 @@ fn draw_statusbar(ctx: &mut Context, state: &mut State) {
 
         if state.buffer.is_overtype() && ctx.button("overtype", Overflow::Clip, "OVR") {
             state.buffer.set_overtype(false);
+            ctx.needs_rerender();
         }
 
         if state.buffer.is_dirty() {

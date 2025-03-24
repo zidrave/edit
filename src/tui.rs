@@ -1017,6 +1017,7 @@ impl Context<'_, '_> {
 
     pub fn set_clipboard(&mut self, data: Vec<u8>) {
         self.tui.clipboard = data;
+        self.needs_rerender();
     }
 
     pub fn get_clipboard(&self) -> &[u8] {
