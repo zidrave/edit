@@ -2107,6 +2107,9 @@ impl TextBuffer {
         if self.undo_stack.is_empty() {
             self.last_history_type = HistoryType::Other;
         }
+
+        // Also takes care of clearing `cursor_for_rendering`.
+        self.reflow(false);
     }
 
     pub fn read_backward(&self, off: usize) -> &[u8] {
