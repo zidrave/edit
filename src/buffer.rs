@@ -809,9 +809,10 @@ impl TextBuffer {
         self.selection.is_some()
     }
 
-    fn set_selection(&mut self, selection: TextBufferSelection) {
+    fn set_selection(&mut self, selection: TextBufferSelection) -> u32 {
         self.selection = selection;
         self.selection_generation = self.selection_generation.wrapping_add(1);
+        self.selection_generation
     }
 
     pub fn selection_update_visual(&mut self, visual_pos: Point) {
@@ -924,7 +925,7 @@ impl TextBuffer {
         let search = match &self.search {
             Some(search) => unsafe { &mut *search.get() },
             None => {
-                let search = self.construct_search(pattern, options)?;
+                let search = self.find_construct_search(pattern, options)?;
                 self.search = Some(UnsafeCell::new(search));
                 unsafe { &mut *self.search.as_ref().unwrap().get() }
             }
@@ -936,31 +937,21 @@ impl TextBuffer {
             return Ok(());
         }
 
-        // As per icu.h:
-        // > The subject string data must not be altered after calling this function until
-        // > after all regular expression operations involving this string data are completed.
-        // In other words, whenever the buffer changes, we call `uregex_setUText`.
-        // TODO: Doesn't work for some reason... It still fails to find all matches during Find & Replace.
-        if search.buffer_generation != self.buffer.generation {
-            search.buffer_generation = self.buffer.generation;
-            unsafe { search.regex.refresh_text(&search.text) };
-        }
-
         // If the user moved the cursor since the last search, but the needle remained the same,
         // we still need to move the start of the search to the new cursor position.
         let next_search_offset = match self.selection {
-            TextBufferSelection::Active { beg, .. } | TextBufferSelection::Done { beg, .. } => {
-                self.cursor_move_to_logical_internal(self.cursor, beg)
-                    .offset
+            TextBufferSelection::Active { beg, end } | TextBufferSelection::Done { beg, end } => {
+                if self.selection_generation == search.selection_generation {
+                    search.next_search_offset
+                } else {
+                    self.cursor_move_to_logical_internal(self.cursor, beg.min(end))
+                        .offset
+                }
             }
             _ => self.cursor.offset,
         };
-        if search.next_search_offset != next_search_offset {
-            search.next_search_offset = next_search_offset;
-            search.regex.reset(next_search_offset);
-        }
 
-        self.select_next(search, true);
+        self.find_select_next(search, next_search_offset, true);
         Ok(())
     }
 
@@ -989,21 +980,23 @@ impl TextBuffer {
         options: SearchOptions,
         replacement: &str,
     ) -> apperr::Result<()> {
-        let mut search = self.construct_search(pattern, options)?;
+        let replacement = replacement.as_bytes();
+        let mut search = self.find_construct_search(pattern, options)?;
+        let mut offset = 0;
 
         loop {
-            self.select_next(&mut search, false);
+            self.find_select_next(&mut search, offset, false);
             if !self.has_selection() {
                 break;
             }
-            // TODO: Doesn't work for some reason... Ctrl+Z breaks the entire buffer.
-            self.write(replacement.as_bytes(), true);
+            self.write(replacement, true);
+            offset = self.cursor.offset;
         }
 
         Ok(())
     }
 
-    fn construct_search(
+    fn find_construct_search(
         &self,
         pattern: &str,
         options: SearchOptions,
@@ -1059,7 +1052,17 @@ impl TextBuffer {
         })
     }
 
-    fn select_next(&mut self, search: &mut ActiveSearch, wrap: bool) {
+    fn find_select_next(&mut self, search: &mut ActiveSearch, offset: usize, wrap: bool) {
+        if search.buffer_generation != self.buffer.generation {
+            unsafe { search.regex.set_text(&search.text) };
+            search.buffer_generation = self.buffer.generation;
+        }
+
+        if search.next_search_offset != offset {
+            search.next_search_offset = offset;
+            search.regex.reset(offset);
+        }
+
         let mut hit = search.regex.next();
 
         // If we hit the end of the buffer, and we know that there's something to find,
@@ -1070,18 +1073,14 @@ impl TextBuffer {
             hit = search.regex.next();
         }
 
-        // This simply matches how set_selection() works.
-        // I do it this way because the borrow checker is hella annoying.
-        search.selection_generation = self.selection_generation.wrapping_add(1);
-
-        if let Some(range) = hit {
+        search.selection_generation = if let Some(range) = hit {
             // Now the search offset is no more at the start of the buffer.
-            search.next_search_offset = range.start;
+            search.next_search_offset = range.end;
 
             let beg = self.cursor_move_to_offset_internal(self.cursor, range.start);
             let end = self.cursor_move_to_offset_internal(beg, range.end);
 
-            self.set_cursor_internal(end);
+            self.set_cursor(end);
             self.make_cursor_visible();
 
             self.set_selection(TextBufferSelection::Done {
