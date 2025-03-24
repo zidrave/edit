@@ -51,6 +51,7 @@ enum TextBufferSelection {
     Active { beg: Point, end: Point },
     Done { beg: Point, end: Point },
 }
+
 impl TextBufferSelection {
     fn is_some(&self) -> bool {
         !matches!(self, Self::None)
@@ -84,7 +85,9 @@ struct ActiveSearch {
     options: SearchOptions,
     text: icu::Text,
     regex: icu::Regex,
-    at_start: bool,
+    buffer_generation: u32,
+    selection_generation: u32,
+    next_search_offset: usize,
     no_matches: bool,
 }
 
@@ -153,7 +156,8 @@ pub struct TextBuffer {
     // Must be cleared on every edit or reflow.
     cursor_for_rendering: Option<ucd::UcdCursor>,
     selection: TextBufferSelection,
-    search: Option<ActiveSearch>,
+    selection_generation: u32,
+    search: Option<UnsafeCell<ActiveSearch>>,
 
     width: CoordType,
     margin_width: CoordType,
@@ -191,6 +195,7 @@ impl TextBuffer {
             cursor: ucd::UcdCursor::default(),
             cursor_for_rendering: None,
             selection: TextBufferSelection::None,
+            selection_generation: 0,
             search: None,
 
             width: 0,
@@ -219,6 +224,10 @@ impl TextBuffer {
 
     pub fn mark_as_dirty(&mut self) {
         self.last_save_generation = self.buffer.generation.wrapping_sub(1);
+    }
+
+    pub fn get_generation(&self) -> u32 {
+        self.buffer.generation
     }
 
     fn mark_as_clean(&mut self) {
@@ -487,7 +496,7 @@ impl TextBuffer {
         self.last_history_type = HistoryType::Other;
         self.cursor = ucd::UcdCursor::default();
         self.cursor_for_rendering = None;
-        self.selection = TextBufferSelection::None;
+        self.set_selection(TextBufferSelection::None);
         self.search = None;
         self.mark_as_clean();
         self.reflow(true);
@@ -796,16 +805,25 @@ impl TextBuffer {
         Ok(())
     }
 
+    pub fn has_selection(&self) -> bool {
+        self.selection.is_some()
+    }
+
+    fn set_selection(&mut self, selection: TextBufferSelection) {
+        self.selection = selection;
+        self.selection_generation = self.selection_generation.wrapping_add(1);
+    }
+
     pub fn selection_update_visual(&mut self, visual_pos: Point) {
         let cursor = self.cursor;
         self.set_cursor_for_selection(self.cursor_move_to_visual_internal(cursor, visual_pos));
 
         match &mut self.selection {
             TextBufferSelection::None | TextBufferSelection::Done { .. } => {
-                self.selection = TextBufferSelection::Active {
+                self.set_selection(TextBufferSelection::Active {
                     beg: cursor.logical_pos,
                     end: self.cursor.logical_pos,
-                };
+                });
             }
             TextBufferSelection::Active { beg: _, end } => {
                 *end = self.cursor.logical_pos;
@@ -819,10 +837,10 @@ impl TextBuffer {
 
         match &mut self.selection {
             TextBufferSelection::None | TextBufferSelection::Done { .. } => {
-                self.selection = TextBufferSelection::Active {
+                self.set_selection(TextBufferSelection::Active {
                     beg: cursor.logical_pos,
                     end: self.cursor.logical_pos,
-                };
+                });
             }
             TextBufferSelection::Active { beg: _, end } => {
                 *end = self.cursor.logical_pos;
@@ -836,10 +854,10 @@ impl TextBuffer {
 
         match &mut self.selection {
             TextBufferSelection::None | TextBufferSelection::Done { .. } => {
-                self.selection = TextBufferSelection::Active {
+                self.set_selection(TextBufferSelection::Active {
                     beg: cursor.logical_pos,
                     end: self.cursor.logical_pos,
-                };
+                });
             }
             TextBufferSelection::Active { beg: _, end } => {
                 *end = self.cursor.logical_pos;
@@ -855,15 +873,15 @@ impl TextBuffer {
         let beg = self.cursor_move_delta_internal(self.cursor, CursorMovement::Word, -1);
         let end = self.cursor_move_delta_internal(beg, CursorMovement::Word, 1);
         self.set_cursor_for_selection(end);
-        self.selection = TextBufferSelection::Done {
+        self.set_selection(TextBufferSelection::Done {
             beg: beg.logical_pos,
             end: end.logical_pos,
-        };
+        });
     }
 
     pub fn selection_finalize(&mut self) {
         if let TextBufferSelection::Active { beg, end } = self.selection {
-            self.selection = TextBufferSelection::Done { beg, end };
+            self.set_selection(TextBufferSelection::Done { beg, end });
         }
     }
 
@@ -871,20 +889,21 @@ impl TextBuffer {
         let beg = ucd::UcdCursor::default();
         let end = self.cursor_move_to_logical_internal(beg, Point::MAX);
         self.set_cursor_for_selection(end);
-        self.selection = TextBufferSelection::Done {
+        self.set_selection(TextBufferSelection::Done {
             beg: beg.logical_pos,
             end: end.logical_pos,
-        };
+        });
     }
 
     pub fn clear_selection(&mut self) -> bool {
         let had_selection = self.selection.is_some();
-        self.selection = TextBufferSelection::None;
+        self.set_selection(TextBufferSelection::None);
         had_selection
     }
 
     pub fn find_and_select(&mut self, pattern: &str, options: SearchOptions) -> apperr::Result<()> {
         if let Some(search) = &mut self.search {
+            let search = search.get_mut();
             // When the search input changes we must reset the search.
             if search.pattern != pattern || search.options != options {
                 self.search = None;
@@ -902,63 +921,142 @@ impl TextBuffer {
             return Ok(());
         }
 
-        if self.search.is_none() {
-            let mut pattern = Cow::Borrowed(pattern);
-            let mut flags = icu::Regex::MULTILINE;
-
-            if !options.match_case {
-                flags |= icu::Regex::CASE_INSENSITIVE;
+        let search = match &self.search {
+            Some(search) => unsafe { &mut *search.get() },
+            None => {
+                let search = self.construct_search(pattern, options)?;
+                self.search = Some(UnsafeCell::new(search));
+                unsafe { &mut *self.search.as_ref().unwrap().get() }
             }
-            if options.whole_word {
-                pattern = Cow::Owned(format!(r"\b(?:{})\b", pattern));
-            }
-            if !options.use_regex {
-                flags |= icu::Regex::LITERAL;
-            }
+        };
 
-            // Move the start of the search to the start of the selection,
-            // or otherwise to the current cursor position.
-            let start_offset = match self.selection {
-                TextBufferSelection::Active { beg, .. } | TextBufferSelection::Done { beg, .. } => {
-                    self.cursor_move_to_logical_internal(self.cursor, beg)
-                        .offset
-                }
-                _ => self.cursor.offset,
-            };
-
-            let text = unsafe { icu::Text::new(self)? };
-            let regex = unsafe { icu::Regex::new(&pattern, flags, &text)? };
-
-            let mut search = ActiveSearch {
-                pattern: pattern.to_string(),
-                options,
-                text,
-                regex,
-                at_start: start_offset == 0,
-                no_matches: false,
-            };
-            if start_offset != 0 {
-                search.regex.reset(start_offset);
-            }
-            self.search = Some(search);
-        }
-
-        let search = self.search.as_mut().unwrap();
+        // If we previously searched through the entire document and found 0 matches,
+        // then we can avoid searching again.
         if search.no_matches {
             return Ok(());
         }
 
+        // As per icu.h:
+        // > The subject string data must not be altered after calling this function until
+        // > after all regular expression operations involving this string data are completed.
+        // In other words, whenever the buffer changes, we call `uregex_setUText`.
+        // TODO: Doesn't work for some reason... It still fails to find all matches during Find & Replace.
+        if search.buffer_generation != self.buffer.generation {
+            search.buffer_generation = self.buffer.generation;
+            unsafe { search.regex.refresh_text(&search.text) };
+        }
+
+        // If the user moved the cursor since the last search, but the needle remained the same,
+        // we still need to move the start of the search to the new cursor position.
+        let next_search_offset = match self.selection {
+            TextBufferSelection::Active { beg, .. } | TextBufferSelection::Done { beg, .. } => {
+                self.cursor_move_to_logical_internal(self.cursor, beg)
+                    .offset
+            }
+            _ => self.cursor.offset,
+        };
+        if search.next_search_offset != next_search_offset {
+            search.next_search_offset = next_search_offset;
+            search.regex.reset(next_search_offset);
+        }
+
+        self.select_next(search, true);
+        Ok(())
+    }
+
+    pub fn find_and_replace(
+        &mut self,
+        pattern: &str,
+        options: SearchOptions,
+        replacement: &str,
+    ) -> apperr::Result<()> {
+        // Editors traditionally replace the previous search hit, not the next possible one.
+        if let (Some(search), TextBufferSelection::Done { .. }) =
+            (&mut self.search, &self.selection)
+        {
+            let search = search.get_mut();
+            if search.selection_generation == self.selection_generation {
+                self.write(replacement.as_bytes(), true);
+            }
+        }
+
+        self.find_and_select(pattern, options)
+    }
+
+    pub fn find_and_replace_all(
+        &mut self,
+        pattern: &str,
+        options: SearchOptions,
+        replacement: &str,
+    ) -> apperr::Result<()> {
+        let mut search = self.construct_search(pattern, options)?;
+
+        loop {
+            self.select_next(&mut search, false);
+            if !self.has_selection() {
+                break;
+            }
+            // TODO: Doesn't work for some reason... Ctrl+Z breaks the entire buffer.
+            self.write(replacement.as_bytes(), true);
+        }
+
+        Ok(())
+    }
+
+    fn construct_search(
+        &self,
+        pattern: &str,
+        options: SearchOptions,
+    ) -> apperr::Result<ActiveSearch> {
+        let mut pattern = Cow::Borrowed(pattern);
+        let mut flags = icu::Regex::MULTILINE;
+
+        if !options.match_case {
+            flags |= icu::Regex::CASE_INSENSITIVE;
+        }
+        if options.whole_word {
+            pattern = Cow::Owned(format!(r"\b(?:{})\b", pattern));
+        }
+        if !options.use_regex {
+            flags |= icu::Regex::LITERAL;
+        }
+
+        // Move the start of the search to the start of the selection,
+        // or otherwise to the current cursor position.
+
+        let text = unsafe { icu::Text::new(self)? };
+        let regex = unsafe { icu::Regex::new(&pattern, flags, &text)? };
+
+        Ok(ActiveSearch {
+            pattern: pattern.to_string(),
+            options,
+            text,
+            regex,
+            buffer_generation: self.buffer.generation,
+            selection_generation: 0,
+            next_search_offset: 0,
+            no_matches: false,
+        })
+    }
+
+    fn select_next(&mut self, search: &mut ActiveSearch, wrap: bool) {
+        let mut hit = search.regex.next();
+
         // If we hit the end of the buffer, and we know that there's something to find,
         // start the search again from the beginning (= wrap around).
-        let mut hit = search.regex.next();
-        if hit.is_none() && !search.at_start {
-            search.at_start = true;
+        if wrap && hit.is_none() && search.next_search_offset != 0 {
+            search.next_search_offset = 0;
             search.regex.reset(0);
             hit = search.regex.next();
         }
 
+        // This simply matches how set_selection() works.
+        // I do it this way because the borrow checker is hella annoying.
+        search.selection_generation = self.selection_generation.wrapping_add(1);
+
         if let Some(range) = hit {
-            search.at_start = false;
+            // Now the search offset is no more at the start of the buffer.
+            search.next_search_offset = range.start;
 
             let beg = self.cursor_move_to_offset_internal(self.cursor, range.start);
             let end = self.cursor_move_to_offset_internal(beg, range.end);
@@ -966,17 +1064,15 @@ impl TextBuffer {
             self.set_cursor_internal(end);
             self.make_cursor_visible();
 
-            self.selection = TextBufferSelection::Done {
+            self.set_selection(TextBufferSelection::Done {
                 beg: beg.logical_pos,
                 end: end.logical_pos,
-            };
+            })
         } else {
             // Avoid searching through the entire document again if we know there's nothing to find.
             search.no_matches = true;
-            self.selection = TextBufferSelection::None;
-        }
-
-        Ok(())
+            self.set_selection(TextBufferSelection::None)
+        };
     }
 
     fn measurement_config(&self) -> ucd::MeasurementConfig {
@@ -1236,7 +1332,7 @@ impl TextBuffer {
     fn set_cursor(&mut self, cursor: ucd::UcdCursor) {
         self.set_cursor_internal(cursor);
         self.last_history_type = HistoryType::Other;
-        self.selection = TextBufferSelection::None;
+        self.set_selection(TextBufferSelection::None);
     }
 
     fn set_cursor_for_selection(&mut self, cursor: ucd::UcdCursor) {
@@ -1558,7 +1654,7 @@ impl TextBuffer {
             if let Some((beg, end)) = self.extract_selection_range() {
                 self.edit_begin(HistoryType::Write, beg);
                 self.edit_delete(end);
-                self.selection = TextBufferSelection::None;
+                self.set_selection(TextBufferSelection::None);
             }
         }
         if self.active_edit_depth <= 0 {
@@ -1694,7 +1790,7 @@ impl TextBuffer {
                 Some(v) => v,
                 None => return,
             };
-            self.selection = TextBufferSelection::None;
+            self.set_selection(TextBufferSelection::None);
         } else {
             if (delta == -1 && self.cursor.offset == 0)
                 || (delta == 1 && self.cursor.offset >= self.text_length())
@@ -1731,7 +1827,7 @@ impl TextBuffer {
             self.edit_begin(HistoryType::Delete, beg);
             self.edit_delete(end);
             self.edit_end();
-            self.selection = TextBufferSelection::None;
+            self.set_selection(TextBufferSelection::None);
         }
 
         out

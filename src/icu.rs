@@ -243,6 +243,7 @@ impl Text {
         let ut = unsafe { &mut *ptr };
         ut.p_funcs = &FUNCS;
         ut.context = tb as *const TextBuffer as *mut _;
+        ut.a = tb.get_generation() as i64;
 
         // ICU unfortunately expects a `UText` instance to have valid contents after construction.
         utext_access(ut, 0, true);
@@ -296,6 +297,7 @@ extern "C" fn utext_clone(
         ut.chunk_contents = dst_cache.utf16.as_ptr();
         ut.p_funcs = src.p_funcs;
         ut.context = src.context;
+        ut.a = src.a;
 
         // I wonder if it would make sense to use a Cow here. But probably not.
         std::ptr::copy_nonoverlapping(src_cache, dst_cache, 1);
@@ -322,19 +324,27 @@ extern "C" fn utext_access(ut: &mut icu_ffi::UText, native_index: i64, forward: 
 
     let index_contained = index_contained as usize;
     let native_index = native_index as usize;
-
     let double_cache = double_cache_from_utext(ut);
+    let dirty = ut.a != tb.get_generation() as i64;
 
-    for cache in &double_cache.cache {
-        if cache.utf8_range.contains(&index_contained) {
-            ut.chunk_contents = cache.utf16.as_ptr();
-            ut.chunk_length = cache.utf16_len as i32;
-            ut.chunk_offset =
-                cache.utf8_to_utf16_offsets[native_index - cache.utf8_range.start] as i32;
-            ut.chunk_native_start = cache.utf8_range.start as i64;
-            ut.chunk_native_limit = cache.utf8_range.end as i64;
-            ut.native_indexing_limit = cache.native_indexing_limit as i32;
-            return true;
+    if dirty {
+        double_cache.cache[0].utf16_len = 0;
+        double_cache.cache[1].utf16_len = 0;
+        double_cache.cache[0].utf8_range = 0..0;
+        double_cache.cache[1].utf8_range = 0..0;
+        ut.a = tb.get_generation() as i64;
+    } else {
+        for cache in &double_cache.cache {
+            if cache.utf8_range.contains(&index_contained) {
+                ut.chunk_contents = cache.utf16.as_ptr();
+                ut.chunk_length = cache.utf16_len as i32;
+                ut.chunk_offset =
+                    cache.utf8_to_utf16_offsets[native_index - cache.utf8_range.start] as i32;
+                ut.chunk_native_start = cache.utf8_range.start as i64;
+                ut.chunk_native_limit = cache.utf8_range.end as i64;
+                ut.native_indexing_limit = cache.native_indexing_limit as i32;
+                return true;
+            }
         }
     }
 
@@ -541,10 +551,18 @@ impl Regex {
         }
     }
 
+    pub unsafe fn refresh_text(&mut self, text: &Text) {
+        let f = assume_loaded();
+        let mut status = icu_ffi::U_ZERO_ERROR;
+        unsafe { (f.uregex_setUText)(self.0, text.0 as *const _ as *mut _, &mut status) };
+        assert!(status.is_success());
+    }
+
     pub fn reset(&mut self, index: usize) {
         let f = assume_loaded();
         let mut status = icu_ffi::U_ZERO_ERROR;
         unsafe { (f.uregex_reset64)(self.0, index as i64, &mut status) };
+        assert!(status.is_success());
     }
 }
 

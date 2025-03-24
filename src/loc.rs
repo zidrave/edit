@@ -49,11 +49,13 @@ pub enum LocId {
     AboutDialogDescription,
     AboutDialogVersion,
 
-    SearchLabel,
-    SearchClose,
+    SearchNeedleLabel,
+    SearchReplacementLabel,
     SearchMatchCase,
     SearchWholeWord,
     SearchUseRegex,
+    SearchReplaceAll,
+    SearchClose,
 
     EncodingReopen,
     EncodingConvert,
@@ -554,17 +556,17 @@ const S_LANG_LUT: [[&str; LangId::Count as usize]; LocId::Count as usize] = [
         /* en      */ "Version: ",
         /* de      */ "Version: ",
         /* es      */ "Versión: ",
-        /* fr      */ "Version : ",
+        /* fr      */ "Version: ",
         /* it      */ "Versione: ",
         /* ja      */ "バージョン: ",
         /* ko      */ "버전: ",
         /* pt_br   */ "Versão: ",
         /* ru      */ "Версия: ",
-        /* zh_hans */ "版本:",
-        /* zh_hant */ "版本:",
+        /* zh_hans */ "版本: ",
+        /* zh_hant */ "版本: ",
     ],
 
-    // SearchLabel
+    // SearchNeedleLabel (for input field)
     [
         /* en      */ "Find:",
         /* de      */ "Suchen:",
@@ -578,21 +580,21 @@ const S_LANG_LUT: [[&str; LangId::Count as usize]; LocId::Count as usize] = [
         /* zh_hans */ "查找:",
         /* zh_hant */ "尋找:",
     ],
-    // SearchClose
+    // SearchReplacementLabel (for input field)
     [
-        /* en      */ "Close",
-        /* de      */ "Schließen",
-        /* es      */ "Cerrar",
-        /* fr      */ "Fermer",
-        /* it      */ "Chiudi",
-        /* ja      */ "閉じる",
-        /* ko      */ "닫기",
-        /* pt_br   */ "Fechar",
-        /* ru      */ "Закрыть",
-        /* zh_hans */ "关闭",
-        /* zh_hant */ "關閉",
+        /* en      */ "Replace:",
+        /* de      */ "Ersetzen:",
+        /* es      */ "Reemplazar:",
+        /* fr      */ "Remplacer:",
+        /* it      */ "Sostituire:",
+        /* ja      */ "置換:",
+        /* ko      */ "바꾸기:",
+        /* pt_br   */ "Substituir:",
+        /* ru      */ "Замена:",
+        /* zh_hans */ "替换:",
+        /* zh_hant */ "替換:",
     ],
-    // SearchMatchCase
+    // SearchMatchCase (toggle)
     [
         /* en      */ "Match Case",
         /* de      */ "Groß/Klein",
@@ -606,7 +608,7 @@ const S_LANG_LUT: [[&str; LangId::Count as usize]; LocId::Count as usize] = [
         /* zh_hans */ "区分大小写",
         /* zh_hant */ "區分大小寫",
     ],
-    // SearchWholeWord
+    // SearchWholeWord (toggle)
     [
         /* en      */ "Whole Word",
         /* de      */ "Ganzes Wort",
@@ -620,7 +622,7 @@ const S_LANG_LUT: [[&str; LangId::Count as usize]; LocId::Count as usize] = [
         /* zh_hans */ "全字匹配",
         /* zh_hant */ "全字匹配",
     ],
-    // SearchUseRegex
+    // SearchUseRegex (toggle)
     [
         /* en      */ "Use Regex",
         /* de      */ "RegEx",
@@ -633,6 +635,34 @@ const S_LANG_LUT: [[&str; LangId::Count as usize]; LocId::Count as usize] = [
         /* ru      */ "RegEx",
         /* zh_hans */ "正则",
         /* zh_hant */ "正則",
+    ],
+    // SearchReplaceAll (button)
+    [
+        /* en      */ "Replace All",
+        /* de      */ "Alle ersetzen",
+        /* es      */ "Reemplazar todo",
+        /* fr      */ "Remplacer tout",
+        /* it      */ "Sostituisci tutto",
+        /* ja      */ "すべて置換",
+        /* ko      */ "모두 바꾸기",
+        /* pt_br   */ "Substituir tudo",
+        /* ru      */ "Заменить все",
+        /* zh_hans */ "全部替换",
+        /* zh_hant */ "全部取代",
+    ],
+    // SearchClose (button)
+    [
+        /* en      */ "Close",
+        /* de      */ "Schließen",
+        /* es      */ "Cerrar",
+        /* fr      */ "Fermer",
+        /* it      */ "Chiudi",
+        /* ja      */ "閉じる",
+        /* ko      */ "닫기",
+        /* pt_br   */ "Fechar",
+        /* ru      */ "Закрыть",
+        /* zh_hans */ "关闭",
+        /* zh_hant */ "關閉",
     ],
 
     // EncodingReopen

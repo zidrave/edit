@@ -62,11 +62,17 @@ mod ucd_gen;
 mod utf8;
 mod vt;
 
-#[derive(Clone, Copy)]
-enum StateSearch {
+struct StateSearch {
+    kind: StateSearchKind,
+    focus: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StateSearchKind {
     Hidden,
     Disabled,
-    Visible { focus: bool },
+    Search,
+    Replace,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -102,6 +108,7 @@ struct State {
 
     wants_search: StateSearch,
     search_needle: String,
+    search_replacement: String,
     search_options: buffer::SearchOptions,
 
     wants_encoding_focus: bool,
@@ -294,7 +301,7 @@ fn run() -> apperr::Result<()> {
 
 fn draw(ctx: &mut Context, state: &mut State) {
     draw_menubar(ctx, state);
-    if matches!(state.wants_search, StateSearch::Visible { .. }) {
+    if state.wants_search.kind != StateSearchKind::Hidden {
         draw_search(ctx, state);
     }
     draw_editor(ctx, state);
@@ -339,10 +346,15 @@ fn draw(ctx: &mut Context, state: &mut State) {
     if ctx.consume_shortcut(kbmod::CTRL | vk::Q) {
         state.wants_exit = true;
     }
-    if !matches!(state.wants_search, StateSearch::Disabled)
-        && ctx.consume_shortcut(kbmod::CTRL | vk::F)
-    {
-        state.wants_search = StateSearch::Visible { focus: true };
+    if state.wants_search.kind != StateSearchKind::Disabled {
+        if ctx.consume_shortcut(kbmod::CTRL | vk::F) {
+            state.wants_search.kind = StateSearchKind::Search;
+            state.wants_search.focus = true;
+        }
+        if ctx.consume_shortcut(kbmod::CTRL | vk::H) {
+            state.wants_search.kind = StateSearchKind::Replace;
+            state.wants_search.focus = true;
+        }
     }
 }
 
@@ -401,10 +413,15 @@ fn draw_menu_edit(ctx: &mut Context, state: &mut State) {
         state.buffer.write(ctx.get_clipboard(), true);
         ctx.needs_rerender();
     }
-    if !matches!(state.wants_search, StateSearch::Disabled)
-        && ctx.menubar_menu_item(loc(LocId::EditFind), 'F', kbmod::CTRL | vk::F)
-    {
-        state.wants_search = StateSearch::Visible { focus: true };
+    if state.wants_search.kind != StateSearchKind::Disabled {
+        if ctx.menubar_menu_item(loc(LocId::EditFind), 'F', kbmod::CTRL | vk::F) {
+            state.wants_search.kind = StateSearchKind::Search;
+            state.wants_search.focus = true;
+        }
+        if ctx.menubar_menu_item(loc(LocId::EditReplace), 'R', kbmod::CTRL | vk::H) {
+            state.wants_search.kind = StateSearchKind::Replace;
+            state.wants_search.focus = true;
+        }
     }
     if ctx.menubar_menu_item(loc(LocId::EditChangeNewlineSequence), 'N', vk::NULL) {
         let crlf = state.buffer.is_crlf();
@@ -423,6 +440,7 @@ fn draw_menu_edit(ctx: &mut Context, state: &mut State) {
 fn draw_menu_view(ctx: &mut Context, state: &mut State) {
     if ctx.menubar_menu_item(loc(LocId::ViewWordWrap), 'W', kbmod::ALT | vk::Z) {
         state.buffer.toggle_word_wrap();
+        ctx.needs_rerender();
     }
     ctx.menubar_menu_end();
 }
@@ -435,14 +453,28 @@ fn draw_menu_help(ctx: &mut Context, state: &mut State) {
 }
 
 fn draw_search(ctx: &mut Context, state: &mut State) {
-    let mut search_next;
-    let focus = matches!(state.wants_search, StateSearch::Visible { focus: true });
+    enum SearchAction {
+        None,
+        Search,
+        Replace,
+        ReplaceAll,
+    }
 
-    if focus {
-        let selection = state.buffer.extract_selection(false);
-        let selection = helpers::string_from_utf8_lossy_owned(selection);
-        state.search_needle = selection;
-        state.wants_search = StateSearch::Visible { focus: false };
+    let mut action = SearchAction::None;
+    let mut focus = StateSearchKind::Hidden;
+
+    if state.wants_search.focus {
+        state.wants_search.focus = false;
+        focus = StateSearchKind::Search;
+
+        // If the selection is empty, focus the search input field.
+        // Otherwise, focus the replace input field, if it exists.
+        if state.buffer.has_selection() {
+            let selection = state.buffer.extract_selection(false);
+            let selection = helpers::string_from_utf8_lossy_owned(selection);
+            state.search_needle = selection;
+            focus = state.wants_search.kind;
+        }
     }
 
     ctx.block_begin("search");
@@ -450,7 +482,7 @@ fn draw_search(ctx: &mut Context, state: &mut State) {
     ctx.attr_background_rgba(ctx.indexed(IndexedColor::White));
     {
         if ctx.contains_focus() && ctx.consume_shortcut(vk::ESCAPE) {
-            state.wants_search = StateSearch::Hidden;
+            state.wants_search.kind = StateSearchKind::Hidden;
         }
 
         ctx.table_begin("needle");
@@ -459,19 +491,45 @@ fn draw_search(ctx: &mut Context, state: &mut State) {
             height: 0,
         });
         {
-            ctx.table_next_row();
+            {
+                ctx.table_next_row();
+                ctx.label("label", Overflow::Clip, loc(LocId::SearchNeedleLabel));
 
-            ctx.label("label", Overflow::Clip, loc(LocId::SearchLabel));
-
-            search_next = ctx.editline("input", &mut state.search_needle);
-            ctx.attr_intrinsic_size(Size {
-                width: COORD_TYPE_SAFE_MAX,
-                height: 1,
-            });
-            if focus {
-                ctx.steal_focus();
+                if ctx.editline("needle", &mut state.search_needle) {
+                    action = SearchAction::Search;
+                }
+                ctx.attr_intrinsic_size(Size {
+                    width: COORD_TYPE_SAFE_MAX,
+                    height: 1,
+                });
+                if focus == StateSearchKind::Search {
+                    ctx.steal_focus();
+                }
+                if ctx.is_focused() && ctx.consume_shortcut(vk::RETURN) {
+                    action = SearchAction::Search;
+                }
             }
-            search_next |= ctx.is_focused() && ctx.consume_shortcut(vk::RETURN);
+
+            if state.wants_search.kind == StateSearchKind::Replace {
+                ctx.table_next_row();
+                ctx.label("label", Overflow::Clip, loc(LocId::SearchReplacementLabel));
+
+                ctx.editline("replacement", &mut state.search_replacement);
+                ctx.attr_intrinsic_size(Size {
+                    width: COORD_TYPE_SAFE_MAX,
+                    height: 1,
+                });
+                if focus == StateSearchKind::Replace {
+                    ctx.steal_focus();
+                }
+                if ctx.is_focused() {
+                    if ctx.consume_shortcut(vk::RETURN) {
+                        action = SearchAction::Replace;
+                    } else if ctx.consume_shortcut(kbmod::CTRL_ALT | vk::RETURN) {
+                        action = SearchAction::ReplaceAll;
+                    }
+                }
+            }
         }
         ctx.table_end();
 
@@ -482,10 +540,6 @@ fn draw_search(ctx: &mut Context, state: &mut State) {
         });
         {
             ctx.table_next_row();
-
-            if ctx.button("close", Overflow::Clip, "Close") {
-                state.wants_search = StateSearch::Hidden;
-            }
 
             let mut change = false;
             change |= ctx.checkbox(
@@ -507,34 +561,61 @@ fn draw_search(ctx: &mut Context, state: &mut State) {
                 &mut state.search_options.use_regex,
             );
             if change {
-                search_next = true;
-                state.wants_search = StateSearch::Visible { focus: true };
+                action = SearchAction::Search;
+                state.wants_search.focus = true;
+                ctx.needs_rerender();
+            }
+
+            if state.wants_search.kind == StateSearchKind::Replace {
+                if ctx.button("replace-all", Overflow::Clip, loc(LocId::SearchReplaceAll)) {
+                    action = SearchAction::ReplaceAll;
+                }
+            }
+
+            if ctx.button("close", Overflow::Clip, loc(LocId::SearchClose)) {
+                state.wants_search.kind = StateSearchKind::Hidden;
             }
         }
         ctx.table_end();
     }
     ctx.block_end();
 
-    if search_next {
-        if let Err(err) = state
+    let result = match action {
+        SearchAction::None => return,
+        SearchAction::Search => state
             .buffer
-            .find_and_select(&state.search_needle, state.search_options)
-        {
-            if err == apperr::APP_ICU_MISSING {
-                state.wants_search = StateSearch::Disabled;
-            }
-            error_log_add(state, err);
+            .find_and_select(&state.search_needle, state.search_options),
+        SearchAction::Replace => state.buffer.find_and_replace(
+            &state.search_needle,
+            state.search_options,
+            &state.search_replacement,
+        ),
+        SearchAction::ReplaceAll => state.buffer.find_and_replace_all(
+            &state.search_needle,
+            state.search_options,
+            &state.search_replacement,
+        ),
+    };
+
+    if let Err(err) = result {
+        if err == apperr::APP_ICU_MISSING {
+            state.wants_search.kind = StateSearchKind::Disabled;
         }
+        error_log_add(ctx, state, err);
     }
+
+    ctx.needs_rerender();
 }
 
 fn draw_editor(ctx: &mut Context, state: &mut State) {
     let size = ctx.size();
     // TODO: The layout code should be able to just figure out the height on its own.
-    let mut height_reduction = 2;
-    if matches!(state.wants_search, StateSearch::Visible { .. }) {
-        height_reduction += 2;
-    }
+    let height_reduction = match state.wants_search.kind {
+        StateSearchKind::Search => 4,
+        StateSearchKind::Replace => 5,
+        _ => 2,
+    };
+
     ctx.textarea("textarea", state.buffer.clone());
     ctx.inherit_focus();
     ctx.attr_intrinsic_size(Size {

@@ -87,10 +87,10 @@ impl std::ops::BitOrAssign for InputKeyMod {
 pub mod vk {
     use super::InputKey;
 
-    pub const NULL: InputKey = InputKey::new(0x00);
+    pub const NULL: InputKey = InputKey::new('\0' as u32);
     pub const BACK: InputKey = InputKey::new(0x08);
-    pub const TAB: InputKey = InputKey::new(0x09);
-    pub const RETURN: InputKey = InputKey::new(0x0D);
+    pub const TAB: InputKey = InputKey::new('\t' as u32);
+    pub const RETURN: InputKey = InputKey::new('\r' as u32);
     pub const ESCAPE: InputKey = InputKey::new(0x1B);
     pub const SPACE: InputKey = InputKey::new(' ' as u32);
     pub const PRIOR: InputKey = InputKey::new(0x21);
@@ -295,6 +295,7 @@ impl<'parser, 'vt, 'input> Stream<'parser, 'vt, 'input> {
                 }
                 vt::Token::Ctrl(ch) => match ch {
                     '\0' | '\t' | '\r' => return Some(Input::Keyboard(InputKey::new(ch as u32))),
+                    '\n' => return Some(Input::Keyboard(kbmod::CTRL | vk::RETURN)),
                     ..='\x1a' => {
                         // Shift control code to A-Z
                         let key = ch as u32 | 0x40;
@@ -306,6 +307,7 @@ impl<'parser, 'vt, 'input> Stream<'parser, 'vt, 'input> {
                 vt::Token::Esc(ch) => {
                     match ch {
                         '\0' => return Some(Input::Keyboard(vk::ESCAPE)),
+                        '\n' => return Some(Input::Keyboard(kbmod::CTRL_ALT | vk::RETURN)),
                         ' '..='~' => {
                             let ch = ch as u32;
                             let key = ch & !0x20; // Shift a-z to A-Z
