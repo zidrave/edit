@@ -1,25 +1,21 @@
 // TODO:
+// * Find & Replace doesn't find all matches.
+// * Find & Replace All, followed by Ctrl+Z breaks the buffer.
+// * Rapid clicking on buttons is recognized as double clicks.
+// * And of course the word wrap dilemma.
+// --------------------------------------------------
 // * Backspace at an indented line start should unindent by 1.
 // * ...same for Shift+Tab.
-// * Backspace undo grouping.
 // * Goto line
-// * When focus changes, all scrollareas in the path should scroll the item into view
-// * Windows should have a yedit titlebar
-// * yori colors
 // * grid layout
-// * Checking if the focus-down path is identical to focus-up, so that drags stay in their path and clicks only click.
 // * Output diffing / compression
 // * BUG: When word-wrap is enabled, insert a tab into the last word of the first of a wrapped line.
 //   The entire word will wrap with the tab in the middle, as if the tab is not whitespace.
-// * COMMIT_MESSAGE, --rulers, .editorconfig
-// --------------------------------------------------
 // * This would allow us to skip computing the stats.visual_lines,
 //   because we could simply scroll by the number of logical lines.
 // * Word wrapping could not be part of ucd, but rather get computed
 //   lazily by the render function. This trivializes everything else.
-// * Replace
 // * Multi-Cursor
-// * Scrolling by dragging the track/thumb
 // * For the focus path we can use the tree depth to O(1) check if the path contains the focus.
 
 #![allow(
