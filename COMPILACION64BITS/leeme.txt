@@ -1,0 +1,1 @@
+version compilada para 64bits
