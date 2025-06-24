@@ -1,1 +1,12 @@
-version compilada para 64bits
+Version compilada para 64bits
+******************************
+
+si se te hace engorroso y tedioso instalar rust y sus dependencias para compilar aqui te dejo el binario ya compulado
+sigue estos comandos:
+
+wget https://github.com/zidrave/edit/raw/refs/heads/main/COMPILACION64BITS/edit
+chmod +x edit
+sudo cp edit /usr/local/bin/
+
+listo de esta manera tendremos el hermoso EDIT de MSDOS en nuestro linux 
+solo es apto para intel y amd de 64 bits!
