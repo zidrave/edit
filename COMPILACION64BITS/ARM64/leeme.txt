@@ -5,4 +5,5 @@ tambien sirve en raspberry pero con OS 64bits
 wget https://github.com/zidrave/edit/raw/refs/heads/main/COMPILACION64BITS/ARM64/edit
 chmod +x edit
 sudo cp edit /usr/local/bin/
+hash -r
 
