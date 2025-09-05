@@ -1,1 +1,2 @@
-ass
+Esta es la version de ARM 64 bits para servidores de la nube normalmente
+tambien sirve en raspberry pero con OS 64bits
