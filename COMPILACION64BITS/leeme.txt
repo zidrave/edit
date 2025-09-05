@@ -1,5 +1,7 @@
 Version compilada para 64bits
 ******************************
+ARQUITECTURA: x86-64 (intel AMD)
+
 
 si se te hace engorroso y tedioso instalar rust y sus dependencias para compilar aqui te dejo el binario ya compulado
 sigue estos comandos:
