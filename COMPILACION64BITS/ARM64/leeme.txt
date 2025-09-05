@@ -6,4 +6,4 @@ wget https://github.com/zidrave/edit/raw/refs/heads/main/COMPILACION64BITS/ARM64
 chmod +x edit
 sudo cp edit /usr/local/bin/
 hash -r
-
+#hash -r es para refrescar los comandos de la shell a veces cachea algo q no encontro y asi agregues sigue sin encontrarlo
