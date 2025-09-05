@@ -1,2 +1,8 @@
 Esta es la version de ARM 64 bits para servidores de la nube normalmente
 tambien sirve en raspberry pero con OS 64bits
+
+
+wget https://github.com/zidrave/edit/raw/refs/heads/main/COMPILACION64BITS/ARM64/edit
+chmod +x edit
+sudo cp edit /usr/local/bin/
+
